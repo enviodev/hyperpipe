@@ -1,0 +1,50 @@
+# HyperPipe + Postgres, one command:
+#
+#   cp deploy/pipeline.example.yaml deploy/pipeline.yaml   # edit to taste
+#   echo "HYPERSYNC_BEARER_TOKEN=..." > deploy/hyperpipe.env
+#   docker compose -f deploy/docker-compose.yaml up --build
+#
+# State (checkpoint) and postgres data persist in named volumes.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: hyperpipe
+      POSTGRES_DB: hyperpipe
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  hyperpipe:
+    build: ..
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - hyperpipe.env                    # HYPERSYNC_BEARER_TOKEN, extra secrets
+    environment:
+      # Resolves ${secret:PG_MAIN_DSN} in the pipeline; points at the postgres service.
+      HYPERPIPE_SECRET_PG_MAIN_DSN: postgres://postgres:hyperpipe@postgres:5432/hyperpipe
+      RUST_LOG: hyperpipe=info
+      HYPERPIPE_HEALTH_PORT: "9000"
+    volumes:
+      - ./pipeline.yaml:/etc/hyperpipe/pipeline.yaml:ro
+      - state:/state
+    ports:
+      - "9000:9000"                      # /healthz, /readyz
+    healthcheck:
+      # slim image has no curl; bash /dev/tcp does the job
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /healthz HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n' >&3 && grep -q ' 200 ' <&3"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  state:

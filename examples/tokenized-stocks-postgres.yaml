@@ -1,0 +1,78 @@
+# Tokenized stocks (Backed xStocks) -> Postgres.
+# Multi-chain Transfer stream for STRCx / TSLAx / CRCLx, decoded and upserted.
+# Contracts + chains from github.com/enviodev/rwa (indexers/tokenized-stocks).
+#
+# Sink shown: builtin/postgres@1 (upsert + auto-DDL + column_map).
+# Secrets: HYPERPIPE_SECRET_PG_DSN
+name: tokenized-stocks-postgres
+version: 1
+
+runtime:
+  resource_size: m
+  checkpoint:
+    store: sqlite
+    path: ./state/stocks-pg.db
+
+sources:
+  - name: eth_stocks
+    chain: ethereum
+    mode: live
+    confirmations: 12
+    query:
+      logs:
+        - address:
+            - "0x1aad217b8f78dba5e6693460e8470f8b1a3977f3"   # STRCx
+            - "0x8ad3c73f833d3f9a523ab01476625f269aeb7cf0"   # TSLAx
+            - "0xfebded1b0986a8ee107f5ab1a1c5a813491deceb"   # CRCLx
+          topics: [["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]]
+      field_selection:
+        log: [address, topic0, topic1, topic2, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+  - name: arb_stocks
+    chain: arbitrum
+    mode: live
+    confirmations: 20
+    query:
+      logs:
+        - address:
+            - "0x1aad217b8f78dba5e6693460e8470f8b1a3977f3"   # STRCx (same address on Arbitrum)
+            - "0x8ad3c73f833d3f9a523ab01476625f269aeb7cf0"   # TSLAx
+            - "0xfebded1b0986a8ee107f5ab1a1c5a813491deceb"   # CRCLx
+          topics: [["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]]
+      field_selection:
+        log: [address, topic0, topic1, topic2, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+processors:
+  - name: decode
+    module: builtin/evm-abi-decoder@1
+    inputs: [eth_stocks, arb_stocks]
+    config:
+      abis:
+        - file: ./abis/erc20.json
+          events: [Transfer]
+      on_undecodable: drop
+
+sinks:
+  - name: pg
+    module: builtin/postgres@1
+    inputs: [decode]
+    connections: [pgmain]
+    config:
+      connection: pgmain
+      table: stock_transfers
+      mode: upsert
+      # address (token contract) stays as its own column; chain_id distinguishes chains.
+      unique_key: [chain_id, block_number, log_index]
+      create_table: true
+      column_map:
+        params.from: from_address
+        params.to: to_address
+        params.value: amount
+
+connections:
+  pgmain:
+    type: postgres
+    dsn: ${secret:PG_DSN}
+    pool: { max: 8 }

@@ -1,0 +1,23 @@
+# Built-in HyperSync chain registry. name -> { chain_id, url }.
+# Override in YAML with `chain_id:` and/or `url:` on the source.
+# HyperSync endpoints follow the pattern https://<chain>.hypersync.xyz
+
+[ethereum]
+chain_id = 1
+url = "https://eth.hypersync.xyz"
+
+[base]
+chain_id = 8453
+url = "https://base.hypersync.xyz"
+
+[arbitrum]
+chain_id = 42161
+url = "https://arbitrum.hypersync.xyz"
+
+[optimism]
+chain_id = 10
+url = "https://optimism.hypersync.xyz"
+
+[polygon]
+chain_id = 137
+url = "https://polygon.hypersync.xyz"

@@ -1,0 +1,57 @@
+# Tokenized stock whale alerts -> webhook.
+# Decode TSLAx/CRCLx transfers, keep only large ones, POST to a webhook (Slack).
+#
+# Sinks shown: builtin/filter@1 (threshold) + builtin/webhook@1 (capability-gated HTTP).
+# Secrets: HYPERPIPE_SECRET_WEBHOOK_URL
+name: stock-whale-alerts
+version: 1
+
+runtime:
+  resource_size: s
+  checkpoint:
+    store: sqlite
+    path: ./state/whales.db
+
+sources:
+  - name: eth_stocks
+    chain: ethereum
+    mode: live
+    confirmations: 12
+    query:
+      logs:
+        - address:
+            - "0x8ad3c73f833d3f9a523ab01476625f269aeb7cf0"   # TSLAx
+            - "0xfebded1b0986a8ee107f5ab1a1c5a813491deceb"   # CRCLx
+          topics: [["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]]
+      field_selection:
+        log: [address, topic0, topic1, topic2, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+processors:
+  - name: decode
+    module: builtin/evm-abi-decoder@1
+    inputs: [eth_stocks]
+    config:
+      abis:
+        - file: ./abis/erc20.json
+          events: [Transfer]
+      on_undecodable: drop
+
+  - name: whales
+    module: builtin/filter@1
+    inputs: [decode]
+    config:
+      all:
+        # xStocks use 18 decimals; 100 tokens = 100 * 1e18.
+        - { field: params.value, op: gte, value: "100000000000000000000" }
+
+sinks:
+  - name: alert
+    module: builtin/webhook@1
+    inputs: [whales]
+    permissions:
+      http: ["hooks.slack.com"]
+    config:
+      url: ${secret:WEBHOOK_URL}
+      max_batch: 20
+      retry: { attempts: 5, backoff_ms: 1000, max_backoff_ms: 30000 }

@@ -1,0 +1,96 @@
+# RWA fan-out: one decoded stream -> three sinks at once.
+# Backed + Ondo tokenized stocks on Ethereum, decoded once, then:
+#   - every transfer  -> Postgres (queryable) AND S3 Parquet (archive)
+#   - whale transfers -> webhook alert
+# Demonstrates DAG fan-out (one producer, many consumers) and mixed sinks.
+#
+# Secrets: HYPERPIPE_SECRET_PG_DSN, HYPERPIPE_SECRET_WEBHOOK_URL
+name: rwa-multi-sink
+version: 1
+
+runtime:
+  resource_size: l
+  checkpoint:
+    store: sqlite
+    path: ./state/rwa-multi.db
+
+sources:
+  - name: eth_rwa
+    chain: ethereum
+    mode: live
+    confirmations: 12
+    query:
+      logs:
+        - address:
+            - "0x8ad3c73f833d3f9a523ab01476625f269aeb7cf0"   # TSLAx (Backed)
+            - "0xfebded1b0986a8ee107f5ab1a1c5a813491deceb"   # CRCLx (Backed)
+            - "0x2d1f7226bd1f780af6b9a49dcc0ae00e8df4bdee"   # NVDAon (Ondo)
+            - "0xfedc5f4a6c38211c1338aa411018dfaf26612c08"   # SPYon (Ondo)
+          topics: [["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]]
+      field_selection:
+        log: [address, topic0, topic1, topic2, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+processors:
+  - name: decode
+    module: builtin/evm-abi-decoder@1
+    inputs: [eth_rwa]
+    config:
+      abis:
+        - file: ./abis/erc20.json
+          events: [Transfer]
+      on_undecodable: drop
+
+  - name: whales
+    module: builtin/filter@1
+    inputs: [decode]
+    config:
+      all:
+        - { field: params.value, op: gte, value: "100000000000000000000" }
+
+sinks:
+  # 1) full stream -> Postgres (fed straight from decode)
+  - name: pg
+    module: builtin/postgres@1
+    inputs: [decode]
+    connections: [pgmain]
+    config:
+      connection: pgmain
+      table: rwa_transfers
+      mode: upsert
+      unique_key: [chain_id, block_number, log_index]
+      create_table: true
+      column_map:
+        params.from: from_address
+        params.to: to_address
+        params.value: amount
+
+  # 2) full stream -> S3 Parquet archive (also fed from decode)
+  - name: archive
+    module: builtin/s3@1
+    inputs: [decode]
+    connections: [lake]
+    config:
+      connection: lake
+      format: parquet
+      flush_rows: 5000
+
+  # 3) whales only -> webhook
+  - name: alert
+    module: builtin/webhook@1
+    inputs: [whales]
+    permissions:
+      http: ["hooks.slack.com"]
+    config:
+      url: ${secret:WEBHOOK_URL}
+      max_batch: 20
+
+connections:
+  pgmain:
+    type: postgres
+    dsn: ${secret:PG_DSN}
+    pool: { max: 12 }
+  lake:
+    type: s3
+    prefix: "rwa/"
+    local_path: ./state/lake

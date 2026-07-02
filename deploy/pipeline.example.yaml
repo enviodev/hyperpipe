@@ -1,0 +1,63 @@
+# Container-ready pipeline: live USDC transfers on Ethereum -> Postgres.
+# Copy to deploy/pipeline.yaml for docker compose. The ABI is INLINE because the
+# container has no project filesystem; the checkpoint lives on the /state volume.
+name: usdc-eth-docker
+version: 1
+
+runtime:
+  resource_size: m
+  checkpoint:
+    store: sqlite
+    path: /state/checkpoint.db
+
+sources:
+  - name: eth_usdc
+    chain: ethereum
+    mode: live
+    confirmations: 10
+    query:
+      logs:
+        - address: ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+          topics: [["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]]
+      field_selection:
+        log: [address, topic0, topic1, topic2, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+processors:
+  - name: decode
+    module: builtin/evm-abi-decoder@1
+    inputs: [eth_usdc]
+    config:
+      on_undecodable: drop
+      abis:
+        - events: [Transfer]
+          abi:
+            - anonymous: false
+              type: event
+              name: Transfer
+              inputs:
+                - { indexed: true, name: from, type: address }
+                - { indexed: true, name: to, type: address }
+                - { indexed: false, name: value, type: uint256 }
+
+sinks:
+  - name: pg
+    module: builtin/postgres@1
+    inputs: [decode]
+    connections: [pg_main]
+    config:
+      connection: pg_main
+      table: usdc_transfers
+      mode: upsert
+      unique_key: [chain_id, block_number, log_index]
+      create_table: true
+      column_map:
+        params.from: from_address
+        params.to: to_address
+        params.value: amount
+
+connections:
+  pg_main:
+    type: postgres
+    dsn: ${secret:PG_MAIN_DSN}
+    pool: { max: 8 }

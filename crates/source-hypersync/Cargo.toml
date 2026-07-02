@@ -1,0 +1,18 @@
+[package]
+name = "hp-source-hypersync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HyperSync source layer: streaming cursor loop -> batch envelopes."
+
+[dependencies]
+hp-encoding = { workspace = true }
+hp-engine = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }

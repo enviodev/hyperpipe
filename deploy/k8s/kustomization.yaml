@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Edit the image, then: kubectl apply -k deploy/k8s
+images:
+  - name: ghcr.io/your-org/hyperpipe
+    newTag: latest
+
+resources:
+  - secret.example.yaml       # replace with your own Secret (do not commit real values)
+  - configmap-pipeline.yaml
+  - service.yaml
+  - statefulset.yaml

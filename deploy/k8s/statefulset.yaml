@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hyperpipe
+  labels: { app: hyperpipe }
+spec:
+  serviceName: hyperpipe
+  # Single writer per pipeline: the SQLite checkpoint has one writer. Scale by
+  # running MORE pipelines (one StatefulSet per pipeline/shard), not replicas.
+  replicas: 1
+  selector:
+    matchLabels: { app: hyperpipe }
+  template:
+    metadata:
+      labels: { app: hyperpipe }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001            # so the PVC (/state) is writable by the user
+      containers:
+        - name: hyperpipe
+          image: ghcr.io/your-org/hyperpipe:latest
+          imagePullPolicy: IfNotPresent
+          args: ["run", "/etc/hyperpipe/pipeline.yaml"]
+          ports:
+            - { name: health, containerPort: 9000 }
+          envFrom:
+            - secretRef: { name: hyperpipe-secrets }
+          env:
+            - { name: HYPERPIPE_HEALTH_PORT, value: "9000" }
+            - { name: RUST_LOG, value: "hyperpipe=info" }
+          # Liveness: process is alive (not shutting down).
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          # Readiness: pipeline wired and running.
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits: { cpu: "2", memory: "1Gi" }
+          volumeMounts:
+            - { name: state, mountPath: /state }
+            - { name: pipeline, mountPath: /etc/hyperpipe, readOnly: true }
+      # Give the pipeline time to drain on rollout/scale-down.
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: pipeline
+          configMap: { name: hyperpipe-pipeline }
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

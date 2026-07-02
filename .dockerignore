@@ -1,0 +1,12 @@
+target
+**/target
+.git
+.gitignore
+state
+*.db
+*.db-shm
+*.db-wal
+.env
+pipeline.env
+*.cwasm
+/dist

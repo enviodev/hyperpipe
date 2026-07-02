@@ -1,0 +1,75 @@
+package envio:hyperpipe@0.1.0;
+
+interface types {
+  /// Batches cross the boundary as encoded bytes + tag.
+  /// v1 encoding is always json. Guests must check the tag.
+  enum encoding { json, cbor, arrow-ipc }
+
+  record batch {
+    encoding: encoding,
+    data: list<u8>,          // the batch envelope, serialized
+  }
+
+  variant output {
+    batches(list<batch>),    // 0..n output batches (filter -> possibly empty; splitter -> many)
+  }
+
+  record init-ctx {
+    module-name: string,     // node name from YAML
+    config: list<u8>,        // the YAML `config:` block, as JSON bytes
+    pipeline-name: string,
+  }
+}
+
+/// ---- Host imports: the ONLY way a module touches the outside world ----
+interface host {
+  enum log-level { trace, debug, info, warn, error }
+  log: func(level: log-level, message: string);
+  metric-add: func(name: string, value: u64);
+
+  /// Module-scoped durable KV, backed by the checkpoint store.
+  kv-get: func(key: string) -> option<list<u8>>;
+  kv-set: func(key: string, value: list<u8>);
+
+  /// Capability-gated. Host enforces YAML `permissions.http` allowlist by hostname.
+  record http-request {
+    method: string,
+    url: string,
+    headers: list<tuple<string, string>>,
+    body: option<list<u8>>,
+  }
+  record http-response {
+    status: u16,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+  http: func(req: http-request) -> result<http-response, string>;
+
+  /// Connection handles: declared in YAML `connections`, opened by host, referenced by name.
+  sql-exec: func(conn: string, statement: string, params-json: list<u8>) -> result<u64, string>;
+  sql-batch: func(conn: string, statements: list<tuple<string, list<u8>>>) -> result<u64, string>;
+
+  kafka-produce: func(conn: string, topic: string, key: option<list<u8>>, payload: list<u8>) -> result<_, string>;
+  blob-put: func(conn: string, key: string, data: list<u8>) -> result<_, string>;
+}
+
+/// ---- Processor modules ----
+world processor {
+  import host;
+  use types.{init-ctx, batch, output};
+
+  export init: func(ctx: init-ctx) -> result<_, string>;
+  export process: func(input: batch) -> result<output, string>;
+}
+
+/// ---- Sink modules ----
+world sink {
+  import host;
+  use types.{init-ctx, batch};
+
+  export init: func(ctx: init-ctx) -> result<_, string>;
+  /// Returning ok = durable-enough to ack (engine may then advance cursor past this batch).
+  export write: func(input: batch) -> result<_, string>;
+  /// Called on graceful shutdown and before checkpoint barriers. Must push any buffered data.
+  export flush: func() -> result<_, string>;
+}

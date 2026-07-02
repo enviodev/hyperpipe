@@ -1,0 +1,64 @@
+# Ondo tokenized stocks -> S3 Parquet data lake.
+# Archives Transfer events for the Ondo Global Markets stock tokens as Parquet
+# objects, flushed every N rows. Contracts from github.com/enviodev/rwa.
+#
+# Sink shown: builtin/s3@1 (buffered Parquet flush, deterministic keys).
+# For real S3: drop `local_path`, set bucket/region + AWS_* env. Here we write
+# to a local dir so it runs with no credentials.
+name: ondo-stocks-archive
+version: 1
+
+runtime:
+  resource_size: m
+  checkpoint:
+    store: sqlite
+    path: ./state/ondo-s3.db
+
+sources:
+  - name: eth_ondo
+    chain: ethereum
+    mode: live
+    confirmations: 12
+    query:
+      logs:
+        - address:
+            - "0x3632dea96a953c11dac2f00b4a05a32cd1063fae"   # CRCLon
+            - "0x050362ab1072cb2ce74d74770e22a3203ad04ee5"   # MUon
+            - "0x62ca254a363dc3c748e7e955c20447ab5bf06ff7"   # IVVon
+            - "0x2d1f7226bd1f780af6b9a49dcc0ae00e8df4bdee"   # NVDAon
+            - "0xfedc5f4a6c38211c1338aa411018dfaf26612c08"   # SPYon
+            - "0x0e397938c1aa0680954093495b70a9f5e2249aba"   # QQQon
+            - "0xca468554e5c0423ee858fe3942c9568c51fcaa79"   # HIMSon
+          topics: [["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]]
+      field_selection:
+        log: [address, topic0, topic1, topic2, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+processors:
+  - name: decode
+    module: builtin/evm-abi-decoder@1
+    inputs: [eth_ondo]
+    config:
+      abis:
+        - file: ./abis/erc20.json
+          events: [Transfer]
+      on_undecodable: drop
+
+sinks:
+  - name: archive
+    module: builtin/s3@1
+    inputs: [decode]
+    connections: [lake]
+    config:
+      connection: lake
+      format: parquet
+      flush_rows: 5000          # flush a Parquet object every 5k transfers
+      flush_interval_ms: 60000  # ...or at the next checkpoint if slower
+
+connections:
+  lake:
+    type: s3
+    prefix: "ondo-stocks/"
+    local_path: ./state/lake      # dev: local dir. Prod: remove + set bucket/region.
+    # bucket: my-rwa-lake
+    # region: us-east-1

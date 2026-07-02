@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hyperpipe-pipeline
+  labels: { app: hyperpipe }
+data:
+  # Mounted at /etc/hyperpipe/pipeline.yaml. Checkpoint lives on the PVC (/state).
+  # Secrets (${secret:NAME}) resolve from the hyperpipe-secrets Secret via env.
+  pipeline.yaml: |
+    name: usdc-eth
+    runtime:
+      resource_size: m
+      checkpoint:
+        store: sqlite
+        path: /state/checkpoint.db
+    sources:
+      - name: eth_usdc_logs
+        chain: ethereum
+        mode: live
+        from_block: 19000000
+        confirmations: 10
+        query:
+          logs:
+            - address: ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+              topics: [["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]]
+          field_selection:
+            log: [address, topic0, topic1, topic2, data, block_number, log_index, transaction_hash]
+            block: [number, timestamp, hash]
+    processors:
+      - name: decode
+        module: builtin/evm-abi-decoder@1
+        inputs: [eth_usdc_logs]
+        config:
+          # ABI inlined so the module needs no filesystem.
+          abis:
+            - events: [Transfer]
+              abi:
+                - anonymous: false
+                  type: event
+                  name: Transfer
+                  inputs:
+                    - { indexed: true, name: from, type: address }
+                    - { indexed: true, name: to, type: address }
+                    - { indexed: false, name: value, type: uint256 }
+          on_undecodable: drop
+    sinks:
+      - name: pg
+        module: builtin/postgres@1
+        inputs: [decode]
+        connections: [pgmain]
+        config:
+          connection: pgmain
+          table: usdc_transfers
+          mode: upsert
+          unique_key: [chain_id, block_number, log_index]
+          create_table: true
+          column_map:
+            params.from: from_address
+            params.to: to_address
+            params.value: amount
+    connections:
+      pgmain:
+        type: postgres
+        dsn: ${secret:PG_MAIN_DSN}
+        pool: { max: 8 }

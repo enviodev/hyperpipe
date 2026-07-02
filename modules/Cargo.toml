@@ -1,0 +1,32 @@
+# Guest (wasm) workspace. Built for wasm32-wasip2, separate from the native
+# root workspace (which lists `modules` under [workspace.exclude]).
+[workspace]
+resolver = "2"
+members = [
+    "sdk",
+    "blackhole-sink",
+    "stdout-sink",
+    "evm-abi-decoder",
+    "filter",
+    "webhook-sink",
+    "postgres-sink",
+    "s3-sink",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+hyperpipe-sdk = { path = "sdk" }
+hp-encoding = { path = "../crates/encoding" }
+wit-bindgen = "0.41"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1

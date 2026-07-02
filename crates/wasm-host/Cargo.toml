@@ -1,0 +1,24 @@
+[package]
+name = "hp-wasm-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "wasmtime embedding: WIT bindings, host imports, instance pools, limits."
+
+[dependencies]
+hp-encoding = { workspace = true }
+hp-engine = { workspace = true }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+sqlx = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+bytes = { workspace = true }
+object_store = { version = "0.11", features = ["aws"] }
