@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 
 use anyhow::{anyhow, Context, Result};
-use hp_encoding::{Batch, KvStore};
+use hp_encoding::{Batch, ControlRecord, KvStore};
 use hp_engine::config::{Config, ModuleRef, NodeKind};
 use hp_engine::CheckpointStore;
 use hp_source_hypersync::HyperSyncSource;
@@ -234,7 +234,15 @@ pub async fn run(config_path: &Path, debug_stdout: bool) -> Result<()> {
         if start > source.default_start() {
             tracing::info!(source = %name, resume_block = start, "resuming from checkpoint");
         }
-        tasks.push(tokio::spawn(source_task(name, source, start, outs, stop_c, stat)));
+        tasks.push(tokio::spawn(source_task(
+            name,
+            source,
+            start,
+            outs,
+            stop_c,
+            stat,
+            kv.clone(),
+        )));
     }
 
     // drop the wiring map so channels close once producers finish
@@ -346,12 +354,13 @@ async fn source_task(
     outs: Vec<Sender<Batch>>,
     stop: Arc<AtomicBool>,
     stat: Arc<SourceStat>,
+    kv: Arc<dyn KvStore>,
 ) {
     // Meter + fan-out via an internal channel between the source loop and consumers.
     let (tx, mut rx) = channel::<Batch>(8);
     let src_stop = stop.clone();
     let runner = tokio::spawn(async move {
-        if let Err(e) = source.run(start, tx, src_stop).await {
+        if let Err(e) = source.run(start, tx, src_stop, Some(kv)).await {
             tracing::error!(source = %name, "source error: {e}");
         }
     });
@@ -414,6 +423,16 @@ async fn sink_task(name: String, sink: SinkImpl, mut rx: Receiver<Batch>, store:
         // §8.2 rule 1: chunked ranges pin the ack to the range start until the
         // final chunk; ack_block() returns range.to() for ordinary batches.
         let next_block = batch.ack_block();
+        // A rollback control batch rewinds the cursor instead of acking, but
+        // only AFTER the sink has accepted it (so e.g. the postgres sink has
+        // deleted the invalidated rows before the watermark moves back).
+        let rewind_to = match batch.as_control() {
+            Some(ControlRecord::Rollback {
+                invalidate_after_block,
+                ..
+            }) => Some(invalidate_after_block.saturating_add(1)),
+            _ => None,
+        };
         let mut attempt = 0;
         loop {
             let sink2 = sink.clone();
@@ -421,8 +440,17 @@ async fn sink_task(name: String, sink: SinkImpl, mut rx: Receiver<Batch>, store:
             let res = tokio::task::spawn_blocking(move || sink2.write(&b2)).await;
             match res {
                 Ok(Ok(())) => {
-                    // Ack: this sink has accepted `source` up to next_block.
-                    store.ack(&source, &name, next_block);
+                    match rewind_to {
+                        Some(to) => {
+                            if let Err(e) = store.rewind(&source, &name, to).await {
+                                tracing::error!(sink = %name, "cursor rewind failed: {e}; pausing branch");
+                                return; // don't keep acking past a failed rewind
+                            }
+                            tracing::info!(sink = %name, source = %source, rewind_to = to, "reorg rollback applied");
+                        }
+                        // Ack: this sink has accepted `source` up to next_block.
+                        None => store.ack(&source, &name, next_block),
+                    }
                     break;
                 }
                 Ok(Err(e)) => {

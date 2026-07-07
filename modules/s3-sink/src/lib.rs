@@ -7,7 +7,7 @@ pub mod buffer;
 mod wasm_glue {
     use crate::buffer::{ChainBuffers, S3Config};
     use hyperpipe_sdk::serde_json::Value;
-    use hyperpipe_sdk::{export_sink, Batch, InitInfo, Sink};
+    use hyperpipe_sdk::{export_sink, Batch, ControlRecord, InitInfo, Sink};
 
     struct S3Sink {
         cfg: S3Config,
@@ -49,6 +49,25 @@ mod wasm_glue {
         fn flush(&mut self) -> Result<(), String> {
             let all = self.buffers.take_all(self.cfg.format)?;
             self.put_all(all)
+        }
+
+        /// Reorg rollback: purge not-yet-flushed records past the fork so they
+        /// never reach an object. Objects already uploaded are immutable —
+        /// replayed ranges overwrite them only if the same key is produced
+        /// (documented append-only limitation).
+        fn on_control(&mut self, ctrl: ControlRecord) -> Result<(), String> {
+            if let ControlRecord::Rollback {
+                chain_id,
+                invalidate_after_block,
+            } = ctrl
+            {
+                self.buffers.rollback(chain_id, invalidate_after_block);
+                hp_host::log_warn(&format!(
+                    "s3: rollback (chain {chain_id}, blocks > {invalidate_after_block}) — \
+                     purged buffered records; already-uploaded objects are not rewritten"
+                ));
+            }
+            Ok(())
         }
     }
 

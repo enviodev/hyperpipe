@@ -1,0 +1,82 @@
+# HyperPipe demo pipeline: USDC Transfer events on Ethereum + Base,
+# decoded and written to Postgres. Postgres-only variant of
+# usdc-multichain.yaml (no enrich/webhook branch, so it runs with just
+# a HyperSync token and a Postgres DSN).
+#
+# Secrets (set before `hyperpipe run`):
+#   export HYPERPIPE_SECRET_PG_MAIN_DSN='postgres://user:pw@localhost:5432/hyperpipe'
+name: usdc-postgres
+version: 1
+
+runtime:
+  resource_size: m
+  checkpoint:
+    store: sqlite
+    path: ./state/usdc-pg.db
+
+sources:
+  - name: eth_usdc_logs
+    type: hypersync
+    chain: ethereum
+    mode: live
+    from_block: 19000000
+    confirmations: 10          # safe distance from head
+    reorg:                     # rollback-guard tracking (on by default)
+      enabled: true
+      window: 64               # max detectable reorg depth
+    batch:
+      max_records: 5000
+      max_interval_ms: 500
+    query:
+      logs:
+        - address: ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+          topics: [["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]]
+      field_selection:
+        log: [address, topic0, topic1, topic2, topic3, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+  - name: base_usdc_logs
+    type: hypersync
+    chain: base
+    mode: live
+    confirmations: 10
+    query:
+      logs:
+        - address: ["0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"]
+          topics: [["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]]
+      field_selection:
+        log: [address, topic0, topic1, topic2, topic3, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+processors:
+  - name: decode
+    module: builtin/evm-abi-decoder@1
+    inputs: [eth_usdc_logs, base_usdc_logs]
+    config:
+      abis:
+        - file: ./abis/erc20.json
+          events: [Transfer]
+      on_undecodable: drop
+
+sinks:
+  - name: pg_all_transfers
+    module: builtin/postgres@1
+    inputs: [decode]
+    connections: [pg_main]
+    config:
+      connection: pg_main
+      table: usdc_transfers
+      mode: upsert
+      unique_key: [chain_id, block_number, log_index]
+      create_table: true
+      rollback: true           # reorg: delete rows past the fork before replay
+      column_map:
+        params.from: from_address
+        params.to: to_address
+        params.value: amount
+
+connections:
+  pg_main:
+    type: postgres
+    dsn: ${secret:PG_MAIN_DSN}
+    pool: { max: 8 }

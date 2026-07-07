@@ -45,7 +45,10 @@ sources:
     mode: live                # live (default) | backfill | both
     from_block: 19000000      # optional; live default = head, backfill default = 0
     to_block: 19100000        # REQUIRED for backfill, FORBIDDEN for live
-    confirmations: 10         # blocks to lag behind head (reorg window; default 10)
+    confirmations: 10         # blocks to lag behind head (safe distance; default 10)
+    reorg:
+      enabled: true           # rollback-guard tracking (default true)
+      window: 64              # block hashes kept = max detectable reorg depth
     batch:
       max_records: 5000       # max records per batch (default from resource_size)
       max_interval_ms: 500    # reserved (latency bound; not yet enforced)
@@ -67,6 +70,31 @@ sources:
 - **Confirmations** — the engine never emits blocks newer than `head − confirmations`.
 - **Block join** — with `field_selection.block`, each log record gets `block_timestamp` and
   `block_hash` injected; downstream modules never join.
+
+### Reorg stance
+
+Two independent layers; pick either or both:
+
+1. **Safe distance (`confirmations`)** — lag the head so reorgs (almost) never reach the
+   pipeline. Set it at or above your chain's reorg depth (e.g. Ethereum ~5–10,
+   Polygon ~200) and, if you want zero rollback machinery, `reorg: { enabled: false }`.
+   Latency cost: `confirmations × block-time`.
+2. **Rollback tracking (`reorg`, default on)** — the source remembers the hashes of the
+   last `window` emitted blocks (persisted with the checkpoint, so it survives restarts)
+   and checks every HyperSync response's `rollback_guard` against them. On a mismatch it:
+   - locates the fork block by re-fetching the canonical hash chain,
+   - emits a `rollback` control record downstream (`invalidate_after_block` = last good
+     block) — the postgres sink deletes invalidated rows (opt-in `rollback: true` in its
+     config), the s3 sink purges its not-yet-flushed buffer, the webhook sink forwards
+     the rollback record to the consumer,
+   - rewinds its cursor (and the durable checkpoint) to the fork and re-ingests the
+     corrected blocks.
+
+   A reorg deeper than `window` can't be pinpointed; the source then rewinds the whole
+   tracked window (coarse but safe — replays a bit more than strictly needed).
+
+`confirmations: 0` together with `reorg.enabled: false` is rejected at validation for
+live sources — that combination would ingest unconfirmed blocks with no recovery path.
 
 ## `processors[]`
 

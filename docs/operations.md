@@ -54,6 +54,8 @@ quotes stripped): [`examples/pipeline.env.example`](../examples/pipeline.env.exa
   (Never edit while the pipeline runs — single writer.)
 
 - Proof it works: `./scripts/crash-test.sh` (kill -9 loop → exact row counts).
+- Reorg proof: `./scripts/reorg-test.sh` (simulated fork mid-backfill → rollback control
+  record → postgres rows past the fork deleted → canonical blocks re-ingested).
 
 ## Health & lifecycle
 

@@ -6,15 +6,17 @@
 //! endpoint; set `HYPERSYNC_BEARER_TOKEN` (create one at app.envio.dev/api-tokens).
 
 mod client;
+mod reorg;
 
-pub use client::{HyperSyncClient, QueryResponse};
+pub use client::{HyperSyncClient, QueryResponse, RollbackGuard};
+pub use reorg::ReorgTracker;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use hp_encoding::{Batch, BatchKind, BlockRange, ControlRecord};
+use hp_encoding::{Batch, BatchKind, BlockRange, ControlRecord, KvStore};
 use hp_engine::config::{Source, SourceMode};
 use tokio::sync::mpsc::Sender;
 
@@ -27,6 +29,8 @@ pub struct HyperSyncSource {
     from_block: u64,
     to_block: Option<u64>,
     confirmations: u64,
+    reorg_enabled: bool,
+    reorg_window: u64,
     max_records: usize,
     poll_interval: Duration,
 }
@@ -37,7 +41,7 @@ impl HyperSyncSource {
     pub fn from_config(src: &Source, default_max_records: usize) -> Self {
         let ep = src.endpoint();
         let token = std::env::var("HYPERSYNC_BEARER_TOKEN").ok();
-        let client = HyperSyncClient::new(ep.url.clone(), token, &src.query);
+        let client = HyperSyncClient::new(ep.url.clone(), token, &src.query, src.reorg.enabled);
         HyperSyncSource {
             name: src.name.clone(),
             chain_id: ep.chain_id,
@@ -46,6 +50,8 @@ impl HyperSyncSource {
             from_block: src.from_block.unwrap_or(0),
             to_block: src.to_block,
             confirmations: src.confirmations,
+            reorg_enabled: src.reorg.enabled,
+            reorg_window: src.reorg.window.max(1),
             max_records: src.batch.max_records.unwrap_or(default_max_records).max(1),
             poll_interval: Duration::from_millis(500),
         }
@@ -64,10 +70,29 @@ impl HyperSyncSource {
 
     /// Run the cursor loop until EOF (backfill) or `stop` is set. Batches are
     /// sent on `tx`; a full channel blocks the send, which is the backpressure
-    /// signal back to ingestion.
-    pub async fn run(&self, start_cursor: u64, tx: Sender<Batch>, stop: Arc<AtomicBool>) -> Result<()> {
+    /// signal back to ingestion. `kv` (when given) persists the reorg hash
+    /// window across restarts, keyed by source name.
+    pub async fn run(
+        &self,
+        start_cursor: u64,
+        tx: Sender<Batch>,
+        stop: Arc<AtomicBool>,
+        kv: Option<Arc<dyn KvStore>>,
+    ) -> Result<()> {
         let mut cursor = start_cursor.max(self.from_block);
         let mut backoff = Duration::from_millis(250);
+        // KvStore::get may block on IO (the checkpoint store runs a SQLite
+        // read through block_on) — load off the async runtime.
+        let mut tracker = if self.reorg_enabled {
+            let (window, name, kv2) = (self.reorg_window, self.name.clone(), kv.clone());
+            Some(
+                tokio::task::spawn_blocking(move || ReorgTracker::load(window, &name, kv2.as_deref()))
+                    .await
+                    .unwrap_or_else(|_| ReorgTracker::new(window)),
+            )
+        } else {
+            None
+        };
 
         // `live` with from_block unset (0) means "start at head".
         if cursor == 0 && matches!(self.mode, SourceMode::Live) {
@@ -81,7 +106,7 @@ impl HyperSyncSource {
                 return Ok(());
             }
 
-            let resp = match self.client.query(cursor, self.to_block).await {
+            let mut resp = match self.client.query(cursor, self.to_block).await {
                 Ok(r) => {
                     backoff = Duration::from_millis(250);
                     r
@@ -93,6 +118,36 @@ impl HyperSyncSource {
                     continue;
                 }
             };
+
+            // Reorg check BEFORE anything from this response is emitted: if a
+            // stored hash conflicts with what the chain now says, locate the
+            // fork, tell downstream to invalidate, and rewind the cursor.
+            if let Some(t) = tracker.as_mut() {
+                if t.conflict(&resp).is_some() {
+                    let fork = self.locate_fork(t, cursor).await;
+                    tracing::warn!(
+                        source = %self.name,
+                        fork_block = fork,
+                        cursor,
+                        "reorg detected; rolling back blocks > {fork}"
+                    );
+                    t.purge_after(fork);
+                    t.save(&self.name, kv.as_deref());
+                    let rb = Batch::control(
+                        self.name.clone(),
+                        self.chain_id,
+                        ControlRecord::Rollback {
+                            chain_id: self.chain_id,
+                            invalidate_after_block: fork,
+                        },
+                    );
+                    if tx.send(rb).await.is_err() {
+                        return Ok(()); // pipeline shutting down
+                    }
+                    cursor = fork.saturating_add(1).max(self.from_block);
+                    continue;
+                }
+            }
 
             match plan_step(
                 self.mode,
@@ -113,7 +168,7 @@ impl HyperSyncSource {
                     // Truncate to the confirmed window (§5.1): records beyond
                     // `effective_next` were fetched but may still reorg — they
                     // are dropped here and re-fetched once confirmed.
-                    let mut records = resp.records;
+                    let mut records = std::mem::take(&mut resp.records);
                     if effective_next < resp.next_block {
                         records.retain(|r| {
                             block_number_of(r).map_or(true, |b| b < effective_next)
@@ -146,6 +201,13 @@ impl HyperSyncSource {
 
                     cursor = effective_next;
 
+                    // Remember hashes for the blocks just emitted; next poll's
+                    // rollback guard is checked against these.
+                    if let Some(t) = tracker.as_mut() {
+                        t.record(&resp, effective_next);
+                        t.save(&self.name, kv.as_deref());
+                    }
+
                     if matches!(self.mode, SourceMode::Backfill)
                         && matches!(self.to_block, Some(end) if cursor >= end)
                     {
@@ -154,6 +216,37 @@ impl HyperSyncSource {
                     }
                     // `both`: once past to_block/head it degrades to Wait via plan_step.
                 }
+            }
+        }
+    }
+
+    /// Last canonical block we can still trust after a detected reorg. Fetches
+    /// the live hash chain over the tracked window and walks stored hashes
+    /// newest-first until one matches. Falls back to the window start (replay
+    /// everything tracked) when the chain can't be re-fetched — coarse but safe.
+    async fn locate_fork(&self, tracker: &ReorgTracker, cursor: u64) -> u64 {
+        let coarse = || {
+            tracker
+                .min_block()
+                .map(|m| m.saturating_sub(1))
+                .unwrap_or_else(|| cursor.saturating_sub(self.reorg_window + 1))
+        };
+        let from = match tracker.min_block() {
+            Some(m) => m,
+            None => return coarse(),
+        };
+        match self.client.block_hashes(from, cursor).await {
+            Ok(canonical) => {
+                let canon: std::collections::HashMap<u64, String> = canonical.into_iter().collect();
+                tracker.last_matching(&canon).unwrap_or_else(coarse)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    source = %self.name,
+                    "could not fetch canonical hashes to locate fork ({e}); \
+                     rewinding the full tracked window"
+                );
+                coarse()
             }
         }
     }

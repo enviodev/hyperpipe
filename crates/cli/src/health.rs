@@ -22,7 +22,16 @@ pub fn set_state(s: u8) {
 /// Spawn the health server if `HYPERPIPE_HEALTH_PORT` is set. Returns the join
 /// handle (aborted on shutdown) or None.
 pub fn maybe_spawn() -> Option<tokio::task::JoinHandle<()>> {
-    let port: u16 = std::env::var("HYPERPIPE_HEALTH_PORT").ok()?.parse().ok()?;
+    let raw = std::env::var("HYPERPIPE_HEALTH_PORT").ok()?;
+    let port: u16 = match raw.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(
+                "HYPERPIPE_HEALTH_PORT=`{raw}` is not a valid port; health server disabled"
+            );
+            return None;
+        }
+    };
     Some(tokio::spawn(async move {
         if let Err(e) = serve(port).await {
             tracing::warn!("health server stopped: {e}");
@@ -34,7 +43,16 @@ async fn serve(port: u16) -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "health server listening (/healthz, /readyz)");
     loop {
-        let (mut sock, _) = listener.accept().await?;
+        // Transient accept errors (e.g. EMFILE under fd pressure) must not
+        // kill the probe endpoints for the rest of the pod's life.
+        let (mut sock, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!("health server accept error: {e}; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let n = sock.read(&mut buf).await.unwrap_or(0);

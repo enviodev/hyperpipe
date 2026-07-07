@@ -97,6 +97,7 @@ at-least-once crash recovery. See [DEMO.md](./DEMO.md).
 | M5 guest SDK (Processor/Sink traits + macros + host wrappers) | ✅ |
 | M6 evm-abi-decoder (4 golden tests) | ✅ |
 | M7 SQLite checkpointing + crash recovery | ✅ `crash-test.sh`: 300/300, 0 gaps, 15× kill -9 |
+| Reorg handling: rollback_guard tracking → rollback control → sink invalidation + cursor rewind | ✅ `reorg-test.sh`: 120/120 rows, 65 forked rows replaced, 0 stale |
 | M9 sinks: stdout, blackhole, postgres, webhook, **s3 (Parquet)** | ✅ verified vs real pg / webhook / Parquet file |
 | M11 filter builtin (4 tests) + out-of-tree `enrich` example | ✅ |
 | host imports: log, metric, kv, http, sql-exec/batch, **blob-put** | ✅ (kafka = phase 1) |

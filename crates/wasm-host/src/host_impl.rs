@@ -139,11 +139,17 @@ impl HostState {
 /// must not pass an allowlist containing `slack.com`. Unparseable URLs are
 /// denied (fail closed).
 fn host_allowed_by(allow: &[String], url: &str) -> bool {
+    // Hostnames are case-insensitive (reqwest lowercases them); compare
+    // likewise or a mixed-case allowlist entry/URL would be wrongly denied.
     match url_host(url) {
-        Some(host) => allow.iter().any(|h| *h == host),
+        Some(host) => allow.iter().any(|h| h.eq_ignore_ascii_case(&host)),
         None => false,
     }
 }
+
+/// Cap on guest-visible HTTP response bodies. A misbehaving (even allowlisted)
+/// endpoint must not be able to OOM the host by streaming an unbounded body.
+const HTTP_BODY_LIMIT: usize = 32 << 20; // 32 MiB
 
 impl WasiView for HostState {
     fn table(&mut self) -> &mut ResourceTable {
@@ -216,14 +222,25 @@ impl Host for HostState {
             if let Some(body) = req.body {
                 rb = rb.body(body);
             }
-            let resp = rb.send().await.map_err(|e| format!("request: {e}"))?;
+            let mut resp = rb.send().await.map_err(|e| format!("request: {e}"))?;
             let status = resp.status().as_u16();
             let headers = resp
                 .headers()
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect();
-            let body = resp.bytes().await.map_err(|e| format!("body: {e}"))?.to_vec();
+            if let Some(len) = resp.content_length() {
+                if len > HTTP_BODY_LIMIT as u64 {
+                    return Err(format!("response body {len} bytes exceeds {HTTP_BODY_LIMIT} limit"));
+                }
+            }
+            let mut body: Vec<u8> = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(|e| format!("body: {e}"))? {
+                if body.len() + chunk.len() > HTTP_BODY_LIMIT {
+                    return Err(format!("response body exceeds {HTTP_BODY_LIMIT} byte limit"));
+                }
+                body.extend_from_slice(&chunk);
+            }
             Ok::<HttpResponse, String>(HttpResponse { status, headers, body })
         });
         Ok(result)
@@ -384,5 +401,13 @@ mod tests {
     fn deny_by_default() {
         assert!(!host_allowed_by(&[], "https://anywhere.com/x"));
         assert!(!host_allowed_by(&allow(&["a.com"]), "garbage"));
+    }
+
+    #[test]
+    fn allowlist_matches_case_insensitively() {
+        assert!(host_allowed_by(&allow(&["api.example.com"]), "https://API.Example.COM/v1"));
+        assert!(host_allowed_by(&allow(&["API.EXAMPLE.COM"]), "https://api.example.com/v1"));
+        // still no suffix tricks with different case
+        assert!(!host_allowed_by(&allow(&["slack.com"]), "https://EVIL-SLACK.COM/x"));
     }
 }

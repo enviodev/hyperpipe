@@ -43,6 +43,22 @@ pub trait Sink: Sized + Send {
     fn flush(&mut self) -> Result<(), String> {
         Ok(())
     }
+    /// Pipeline control signal (reorg rollback / EOF). Default: ignore. Sinks
+    /// that keep block-addressed state should handle
+    /// [`ControlRecord::Rollback`] by invalidating everything past
+    /// `invalidate_after_block` — return `Ok` only once that is durable.
+    fn on_control(&mut self, _ctrl: ControlRecord) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Lock the module's state mutex, recovering from poisoning. A guest panic
+/// traps the instance and the host discards it, but a poisoned lock must never
+/// turn every later call on a surviving instance into a second panic — the
+/// state itself is only ever replaced wholesale in `init`, so recovery is safe.
+#[doc(hidden)]
+pub fn lock_state<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Decode wire bytes (with a numeric encoding tag) into a [`Batch`].
@@ -160,7 +176,7 @@ macro_rules! export_processor {
                     pipeline_name: ctx.pipeline_name,
                 };
                 let inst = <$ty as $crate::Processor>::init(config, &info)?;
-                *__HP_STATE.lock().unwrap() = ::core::option::Option::Some(inst);
+                *$crate::lock_state(&__HP_STATE) = ::core::option::Option::Some(inst);
                 ::core::result::Result::Ok(())
             }
 
@@ -174,7 +190,7 @@ macro_rules! export_processor {
                         ::std::vec![input],
                     ));
                 }
-                let mut guard = __HP_STATE.lock().unwrap();
+                let mut guard = $crate::lock_state(&__HP_STATE);
                 let inst = guard
                     .as_mut()
                     .ok_or_else(|| ::std::string::String::from("process called before init"))?;
@@ -294,7 +310,7 @@ macro_rules! export_sink {
                     pipeline_name: ctx.pipeline_name,
                 };
                 let inst = <$ty as $crate::Sink>::init(config, &info)?;
-                *__HP_STATE.lock().unwrap() = ::core::option::Option::Some(inst);
+                *$crate::lock_state(&__HP_STATE) = ::core::option::Option::Some(inst);
                 ::core::result::Result::Ok(())
             }
 
@@ -303,20 +319,25 @@ macro_rules! export_sink {
             ) -> ::core::result::Result<(), ::std::string::String> {
                 let tag = __hp_enc_tag(&input.encoding);
                 let batch = $crate::decode_batch(tag, &input.data)?;
-                let mut guard = __HP_STATE.lock().unwrap();
+                let mut guard = $crate::lock_state(&__HP_STATE);
                 let inst = guard
                     .as_mut()
                     .ok_or_else(|| ::std::string::String::from("write called before init"))?;
-                // Sinks handle control batches themselves if they care; default
-                // behavior is to ignore them (they carry no data records).
+                // Control batches route to the sink's on_control hook (default:
+                // ignore); rollback-aware sinks invalidate state there.
                 if batch.is_control() {
-                    return ::core::result::Result::Ok(());
+                    return match batch.as_control() {
+                        ::core::option::Option::Some(ctrl) => {
+                            <$ty as $crate::Sink>::on_control(inst, ctrl)
+                        }
+                        ::core::option::Option::None => ::core::result::Result::Ok(()),
+                    };
                 }
                 <$ty as $crate::Sink>::write(inst, batch)
             }
 
             fn flush() -> ::core::result::Result<(), ::std::string::String> {
-                let mut guard = __HP_STATE.lock().unwrap();
+                let mut guard = $crate::lock_state(&__HP_STATE);
                 match guard.as_mut() {
                     ::core::option::Option::Some(inst) => <$ty as $crate::Sink>::flush(inst),
                     ::core::option::Option::None => ::core::result::Result::Ok(()),

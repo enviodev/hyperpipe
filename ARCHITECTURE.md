@@ -317,8 +317,10 @@ Key behaviors:
 
 ### 5.2 Reorg stance
 
-- **MVP:** `confirmations: N` lag. Simple, honest, covers the demo.
-- **Phase 2:** track a ring buffer of the last ~64 (block_number, block_hash) per chain from HyperSync responses. On hash mismatch at re-poll, emit `rollback` control record and rewind cursor. Sinks that keep `block_number` columns can invalidate (Postgres sink: `DELETE WHERE chain_id = ? AND block_number > ?`). This matches Turbo's guarantee shape.
+Two independently configurable layers (both implemented):
+
+- **Safe distance:** `confirmations: N` lag — the source never emits past `head - N`. Users who set N above the chain's reorg depth can turn tracking off (`reorg: { enabled: false }`) and need no rollback machinery at all. `confirmations: 0` + tracking off is rejected at validation.
+- **Rollback tracking (`reorg: { enabled, window }`, default on, window 64):** the source keeps a bounded window of (block_number, block_hash) for emitted blocks — persisted via the checkpoint KV, so it survives restarts — and checks each response's HyperSync `rollback_guard` (`first_parent_hash` chain check + re-fetched block overlap) against it. On mismatch: locate the fork by re-fetching canonical hashes (`include_all_blocks` headers query), emit a `rollback` control record, rewind the cursor, and re-ingest. The checkpoint store write-through rewinds the durable cursor (the one sanctioned non-monotonic move; stale snapshots are floored at persist so they can't re-raise it). Sink handling: Postgres `DELETE WHERE block_number > ? AND chain_id = ?` (opt-in `rollback: true`), s3 purges its unflushed buffer, webhook forwards the control record. This matches Turbo's guarantee shape.
 
 ---
 
@@ -557,7 +559,7 @@ Rules:
 | Sink down (PG unreachable) | Retries w/ backoff → branch pauses → backpressure to source → cursor frozen. Other sinks keep flowing (independent cursors) |
 | Bad module (trap/OOM) | Instance recycled, batch retried ×3 → branch `degraded`, alert logged, branch paused |
 | HyperSync hiccup | Client retry w/ backoff; cursor untouched until response |
-| Reorg deeper than `confirmations` | MVP: unhandled (documented). Phase 2: rollback control records |
+| Reorg deeper than `confirmations` | rollback_guard tracking → `rollback` control record → sink invalidation + cursor rewind (§5.2). Deeper than `reorg.window`: coarse rewind of the whole tracked window |
 
 ---
 

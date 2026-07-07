@@ -92,6 +92,38 @@ impl CheckpointStore {
         }
     }
 
+    /// Force the (source, sink) cursor DOWN to `next_block` after a reorg
+    /// rollback (the only sanctioned non-monotonic move). Writes through to
+    /// SQLite immediately so a crash right after the rollback cannot resume
+    /// from the stale, higher cursor and skip the corrected blocks.
+    pub async fn rewind(&self, source: &str, sink: &str, next_block: u64) -> Result<()> {
+        {
+            let mut c = self.cursors.lock().unwrap();
+            let e = c
+                .entry((source.to_string(), sink.to_string()))
+                .or_insert(next_block);
+            if next_block < *e {
+                *e = next_block;
+            }
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        sqlx::query(
+            "UPDATE cursors SET next_block=?3, updated_at=?4
+             WHERE source=?1 AND sink=?2 AND next_block > ?3",
+        )
+        .bind(source)
+        .bind(sink)
+        .bind(next_block as i64)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("persist cursor rewind")?;
+        Ok(())
+    }
+
     /// Safe restart block for `source`: the min cursor across the sinks it
     /// feeds. `None` means "no durable progress yet — start from from_block".
     pub fn restore(&self, source: &str, reachable_sinks: &[String]) -> Option<u64> {
@@ -136,6 +168,15 @@ impl CheckpointStore {
 
         let mut tx = self.pool.begin().await.context("begin checkpoint txn")?;
         for (source, sink, next) in snapshot {
+            // Floor against the live watermark: a rollback rewind that landed
+            // after this snapshot was taken must not be re-raised by persisting
+            // the stale, higher value.
+            let next = {
+                let c = self.cursors.lock().unwrap();
+                c.get(&(source.clone(), sink.clone()))
+                    .map(|cur| next.min(*cur))
+                    .unwrap_or(next)
+            };
             sqlx::query(
                 "INSERT INTO cursors (source, sink, next_block, updated_at)
                  VALUES (?1, ?2, ?3, ?4)
@@ -242,6 +283,57 @@ mod tests {
         let sinks = vec!["a".to_string(), "b".to_string()]; // b never acked
         assert_eq!(store.restore("src", &sinks), None);
         assert_eq!(store.restore("src", &[]), None);
+    }
+
+    #[tokio::test]
+    async fn rewind_moves_cursor_down_and_persists() {
+        let path = tmp_db("rewind");
+        {
+            let store = CheckpointStore::open(&path, tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            store.ack("src", "sink", 500);
+            store.persist_snapshot(store.snapshot()).await.unwrap();
+            // reorg: everything after block 99 is void -> next fetch is 100
+            store.rewind("src", "sink", 100).await.unwrap();
+            // stale higher ack after the rewind must not raise it back...
+            store.ack("src", "sink", 90); // ...and a LOWER ack stays ignored too
+            assert_eq!(store.restore("src", &["sink".to_string()]), Some(100));
+        }
+        // ...even across a crash/reopen (write-through)
+        let store = CheckpointStore::open(&path, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+        assert_eq!(store.restore("src", &["sink".to_string()]), Some(100));
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_cannot_reraise_a_rewound_cursor() {
+        // Race: checkpoint tick snapshots 500, a rollback rewinds to 100 during
+        // the flush, then the tick persists. The persisted value must be 100.
+        let path = tmp_db("rewind-race");
+        {
+            let store = CheckpointStore::open(&path, tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            store.ack("src", "sink", 500);
+            let snap = store.snapshot();
+            store.rewind("src", "sink", 100).await.unwrap();
+            store.persist_snapshot(snap).await.unwrap();
+        }
+        let store = CheckpointStore::open(&path, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+        assert_eq!(store.restore("src", &["sink".to_string()]), Some(100));
+    }
+
+    #[tokio::test]
+    async fn rewind_then_replay_acks_forward_again() {
+        let (store, _p) = open("rewind-forward").await;
+        store.ack("src", "sink", 500);
+        store.rewind("src", "sink", 100).await.unwrap();
+        store.ack("src", "sink", 150); // replayed corrected blocks
+        assert_eq!(store.restore("src", &["sink".to_string()]), Some(150));
     }
 
     #[tokio::test]

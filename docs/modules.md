@@ -57,6 +57,10 @@ config:
   mode: upsert                          # insert | upsert
   unique_key: [chain_id, block_number, log_index]   # required for upsert
   create_table: true                    # opt-in auto-DDL from the first batch
+  rollback: true                        # reorg handling: delete rows past the fork
+  # rollback:                           # …or with explicit columns:
+  #   block_number_column: block_number # default
+  #   chain_id_column: chain_id         # default; null = no chain filter
   column_map:                           # dotted record path -> column name
     params.from: from_address
     params.value: amount
@@ -64,10 +68,16 @@ config:
 
 - One batch = **one transaction** (`sql-batch` host import).
 - Columns = all top-level scalar fields, plus `column_map` entries (nested paths, renames).
+  Mixed-shape batches are split into one statement per column signature; auto-DDL uses the
+  union of columns across the batch.
 - Auto-DDL infers types (`bigint`, `numeric` for decimal strings, `boolean`, `double
   precision`, `text`) and logs the generated `CREATE TABLE` loudly. Decimal-string params are
   bound with a `::numeric` cast.
 - Upsert = `INSERT … ON CONFLICT (unique_key) DO UPDATE` → replays are idempotent.
+- **Reorg rollback** (`rollback: true`): on a `rollback` control record the sink runs
+  `DELETE FROM table WHERE block_number > $fork AND chain_id = $chain` before the source
+  replays the corrected blocks. Without it, rollbacks are logged and ignored (stale rows
+  remain until an upsert replay overwrites them — rows that vanished in the reorg linger).
 
 ### `builtin/webhook@1`
 
@@ -76,12 +86,16 @@ permissions: { http: ["hooks.slack.com"] }   # REQUIRED — deny-by-default allo
 config:
   url: ${secret:WEBHOOK_URL}
   max_batch: 500                             # records per POST (re-chunks larger batches)
+  forward_rollbacks: true                    # default: POST reorg rollback records too
 ```
 
 - POSTs records as NDJSON (`application/x-ndjson`); non-2xx = error → engine retries ×3 with
   backoff, then pauses the branch.
 - Delivery is at-least-once — consumers dedupe on record identity
   (`chain_id`,`block_number`,`log_index`) or the batch id.
+- On a reorg the sink POSTs the control record itself
+  (`{"control":"rollback","chain_id":…,"invalidate_after_block":…}`) so the consumer can
+  invalidate what it already received; disable with `forward_rollbacks: false`.
 
 ### `builtin/s3@1` — buffered Parquet/NDJSON objects
 
@@ -97,10 +111,14 @@ config:
   checkpoint barrier fires (default every ~2 s), or the pipeline shuts down.
 - Deterministic keys: `{connection.prefix}{chain_id}/{first_block}-{last_block}-{rows}.{ext}` —
   a replay overwrites the same object (idempotent).
-- Parquet schema: every column `Utf8` nullable, inferred from the first record's keys (sorted).
-  uint256 values stay decimal strings.
+- Parquet schema: every column `Utf8` nullable — the union of keys across all buffered
+  records (sorted). uint256 values stay decimal strings.
 - Cursor safety: acks are only persisted **after** buffers flush (§8.2 rule 5), so a crash
   between buffering and flushing replays those blocks.
+- Reorg rollback: buffered (not yet uploaded) records past the fork are purged. Objects
+  already in S3 are not rewritten — an append-only limitation; the replayed range
+  overwrites an object only when it produces the identical key. If you need strict reorg
+  correctness in the lake, raise the source's `confirmations` above the chain's reorg depth.
 
 ### `builtin/stdout@1` / `builtin/blackhole@1`
 
@@ -128,6 +146,15 @@ impl Processor for MyProc {
     }
 }
 export_processor!(MyProc);        // or: impl Sink + export_sink!(MySink)
+
+// Sinks may additionally override `on_control` to react to reorg rollbacks:
+//   fn on_control(&mut self, ctrl: ControlRecord) -> Result<(), String> {
+//       if let ControlRecord::Rollback { chain_id, invalidate_after_block } = ctrl {
+//           /* invalidate everything past invalidate_after_block */
+//       }
+//       Ok(())
+//   }
+// Default: rollbacks are ignored (fine for stateless/append-only sinks).
 ```
 
 ```bash

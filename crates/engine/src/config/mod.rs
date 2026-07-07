@@ -184,6 +184,8 @@ pub struct Source {
     #[serde(default = "default_confirmations")]
     pub confirmations: u64,
     #[serde(default)]
+    pub reorg: ReorgCfg,
+    #[serde(default)]
     pub batch: BatchCfg,
     pub query: Query,
 
@@ -197,6 +199,39 @@ fn default_source_type() -> String {
 }
 fn default_confirmations() -> u64 {
     10
+}
+
+/// Reorg stance (§5.2). Two layers, independently configurable:
+/// - `confirmations` (above) lags the head so most reorgs never reach the
+///   pipeline. Users who want zero rollback complexity set it high and may
+///   turn tracking off.
+/// - `reorg.enabled` tracks HyperSync's `rollback_guard` block hashes and, on
+///   a mismatch, emits a `rollback` control record and rewinds the cursor.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReorgCfg {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How many recent block hashes to keep per source — the maximum reorg
+    /// depth that can be detected and rolled back.
+    #[serde(default = "default_reorg_window")]
+    pub window: u64,
+}
+
+impl Default for ReorgCfg {
+    fn default() -> Self {
+        ReorgCfg {
+            enabled: true,
+            window: default_reorg_window(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_reorg_window() -> u64 {
+    64
 }
 
 #[derive(Debug, Clone)]
@@ -532,6 +567,29 @@ impl Config {
                         s.name
                     )));
                 }
+            }
+
+            // ---- reorg stance sanity ----
+            if s.reorg.enabled {
+                if s.reorg.window == 0 {
+                    return Err(ConfigError::v(format!(
+                        "sources.{}: reorg.window must be >= 1 when reorg tracking is enabled",
+                        s.name
+                    )));
+                }
+                if s.reorg.window > 10_000 {
+                    return Err(ConfigError::v(format!(
+                        "sources.{}: reorg.window {} too large (max 10000)",
+                        s.name, s.reorg.window
+                    )));
+                }
+            } else if s.confirmations == 0 && !matches!(s.mode, SourceMode::Backfill) {
+                return Err(ConfigError::v(format!(
+                    "sources.{}: confirmations: 0 with reorg.enabled: false would ingest \
+                     unconfirmed blocks with no rollback path; set confirmations >= 1 \
+                     (safe distance from head) or enable reorg tracking",
+                    s.name
+                )));
             }
         }
 

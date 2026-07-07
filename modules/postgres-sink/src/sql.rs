@@ -12,6 +12,11 @@ pub struct PgConfig {
     pub create_table: bool,
     /// record path (dotted) -> column name.
     pub column_map: BTreeMap<String, String>,
+    /// Reorg rollback: delete rows past the fork when a `rollback` control
+    /// record arrives. `None` = ignore rollbacks (stale rows remain).
+    pub rollback_block_column: Option<String>,
+    /// Optional chain filter for the rollback delete (multi-chain tables).
+    pub rollback_chain_column: Option<String>,
 }
 
 impl PgConfig {
@@ -44,6 +49,37 @@ impl PgConfig {
         if upsert && unique_key.is_empty() {
             return Err("postgres: mode upsert requires unique_key".into());
         }
+        // rollback: true (defaults), false/absent (off), or
+        // { block_number_column, chain_id_column } (chain_id_column: null
+        // disables the chain filter).
+        let (rollback_block_column, rollback_chain_column) = match config.get("rollback") {
+            None | Some(Value::Bool(false)) => (None, None),
+            Some(Value::Bool(true)) => {
+                (Some("block_number".to_string()), Some("chain_id".to_string()))
+            }
+            Some(Value::Object(o)) => {
+                let block = match o.get("block_number_column") {
+                    None => "block_number".to_string(),
+                    Some(v) => v
+                        .as_str()
+                        .ok_or("postgres: rollback.block_number_column must be a string")?
+                        .to_string(),
+                };
+                let chain = match o.get("chain_id_column") {
+                    None => Some("chain_id".to_string()),
+                    Some(Value::Null) => None,
+                    Some(v) => Some(
+                        v.as_str()
+                            .ok_or("postgres: rollback.chain_id_column must be a string or null")?
+                            .to_string(),
+                    ),
+                };
+                (Some(block), chain)
+            }
+            Some(_) => {
+                return Err("postgres: config.rollback must be a bool or an object".into())
+            }
+        };
         Ok(PgConfig {
             connection,
             table,
@@ -51,6 +87,8 @@ impl PgConfig {
             unique_key,
             create_table,
             column_map,
+            rollback_block_column,
+            rollback_chain_column,
         })
     }
 }
@@ -115,6 +153,49 @@ fn placeholder(i: usize, v: &Value) -> String {
     match v {
         Value::String(s) if is_decimal(s) => format!("${i}::numeric"),
         _ => format!("${i}"),
+    }
+}
+
+/// Union of columns over all rows (first-seen sample value per column, sorted
+/// by name) — the DDL sample. Rows in one batch may have different key sets
+/// (optional fields, mixed event types), so the table must cover all of them.
+pub fn union_columns(rows: &[Vec<(String, Value)>]) -> Vec<(String, Value)> {
+    let mut union: BTreeMap<String, Value> = BTreeMap::new();
+    for row in rows {
+        for (c, v) in row {
+            union.entry(c.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    union.into_iter().collect()
+}
+
+/// Group rows by their column signature. Each group shares one prepared
+/// statement; binding a row against a statement built from a row with a
+/// DIFFERENT column set would silently put values in the wrong columns (or
+/// fail on parameter count), so heterogeneous batches must be split.
+pub fn group_by_signature(rows: Vec<Vec<(String, Value)>>) -> Vec<Vec<Vec<(String, Value)>>> {
+    let mut groups: BTreeMap<Vec<String>, Vec<Vec<(String, Value)>>> = BTreeMap::new();
+    for row in rows {
+        let sig: Vec<String> = row.iter().map(|(c, _)| c.clone()).collect();
+        groups.entry(sig).or_default().push(row);
+    }
+    groups.into_values().collect()
+}
+
+/// `DELETE` for a reorg rollback: void every row past the fork block.
+pub fn rollback_delete_stmt(table: &str, block_col: &str, chain_col: Option<&str>) -> String {
+    match chain_col {
+        Some(c) => format!(
+            "DELETE FROM {} WHERE {} > $1 AND {} = $2",
+            quote_ident(table),
+            quote_ident(block_col),
+            quote_ident(c)
+        ),
+        None => format!(
+            "DELETE FROM {} WHERE {} > $1",
+            quote_ident(table),
+            quote_ident(block_col)
+        ),
     }
 }
 
@@ -237,5 +318,77 @@ mod tests {
         let row = vec![("a".to_string(), json!(1)), ("b".to_string(), json!("x"))];
         let sql = upsert_stmt("t", &row, &[], false);
         assert!(!sql.contains("ON CONFLICT"));
+    }
+
+    #[test]
+    fn heterogeneous_rows_split_into_signature_groups() {
+        let transfer = vec![
+            ("amount".to_string(), json!("5")),
+            ("block_number".to_string(), json!(1)),
+        ];
+        let approval = vec![
+            ("block_number".to_string(), json!(2)),
+            ("owner".to_string(), json!("0xaaa")),
+        ];
+        let groups = group_by_signature(vec![transfer.clone(), approval.clone(), transfer.clone()]);
+        assert_eq!(groups.len(), 2);
+        let sizes: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+        assert!(sizes.contains(&2) && sizes.contains(&1));
+        // every row in a group shares the exact column list
+        for g in &groups {
+            let sig: Vec<&String> = g[0].iter().map(|(c, _)| c).collect();
+            for row in g {
+                assert_eq!(row.iter().map(|(c, _)| c).collect::<Vec<_>>(), sig);
+            }
+        }
+    }
+
+    #[test]
+    fn ddl_covers_union_of_heterogeneous_rows() {
+        let rows = vec![
+            vec![("a".to_string(), json!(1)), ("b".to_string(), json!("x"))],
+            vec![("a".to_string(), json!(2)), ("c".to_string(), json!("123"))],
+        ];
+        let sample = union_columns(&rows);
+        let names: Vec<&str> = sample.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        let sql = ddl("t", &sample, &[]);
+        assert!(sql.contains("\"b\" text") && sql.contains("\"c\" numeric"), "got {sql}");
+    }
+
+    #[test]
+    fn rollback_delete_quotes_identifiers() {
+        assert_eq!(
+            rollback_delete_stmt("transfers", "block_number", Some("chain_id")),
+            "DELETE FROM \"transfers\" WHERE \"block_number\" > $1 AND \"chain_id\" = $2"
+        );
+        assert_eq!(
+            rollback_delete_stmt("t", "bn", None),
+            "DELETE FROM \"t\" WHERE \"bn\" > $1"
+        );
+        // injection attempt in an identifier stays quoted
+        let evil = rollback_delete_stmt("t\"; DROP TABLE x; --", "bn", None);
+        assert!(evil.starts_with("DELETE FROM \"t\"\"; DROP TABLE x; --\""), "got {evil}");
+    }
+
+    #[test]
+    fn rollback_config_parses_bool_object_and_rejects_junk() {
+        let base = json!({"connection": "pg", "table": "t"});
+        let cfg = PgConfig::from_json(&base).unwrap();
+        assert_eq!(cfg.rollback_block_column, None);
+
+        let on = json!({"connection": "pg", "table": "t", "rollback": true});
+        let cfg = PgConfig::from_json(&on).unwrap();
+        assert_eq!(cfg.rollback_block_column.as_deref(), Some("block_number"));
+        assert_eq!(cfg.rollback_chain_column.as_deref(), Some("chain_id"));
+
+        let custom = json!({"connection": "pg", "table": "t",
+                            "rollback": {"block_number_column": "blk", "chain_id_column": null}});
+        let cfg = PgConfig::from_json(&custom).unwrap();
+        assert_eq!(cfg.rollback_block_column.as_deref(), Some("blk"));
+        assert_eq!(cfg.rollback_chain_column, None);
+
+        let junk = json!({"connection": "pg", "table": "t", "rollback": 7});
+        assert!(PgConfig::from_json(&junk).is_err());
     }
 }

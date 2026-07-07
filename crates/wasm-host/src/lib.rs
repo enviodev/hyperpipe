@@ -60,6 +60,17 @@ fn build_blob(cfg: &BlobConnCfg) -> Result<BlobConn> {
 }
 use host_impl::{proc_bindings, sink_bindings, types_iface, HostState};
 
+/// Shared reqwest client for guest `host.http` calls. Timeouts are mandatory:
+/// epoch interruption cannot preempt a guest parked inside a host import, so
+/// without them one hung endpoint wedges a worker thread forever.
+fn build_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("hyperpipe/0.1")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+}
+
 /// Capability + identity context for one pipeline node.
 #[derive(Clone)]
 pub struct NodeCtx {
@@ -330,11 +341,15 @@ impl WasmProcessor {
         let wire = to_wire(input).map_err(|e| anyhow::anyhow!("encode input: {e}"))?;
         let mut slot = self.checkout()?;
         slot.store.set_epoch_deadline(self.engine_deadline);
-        let call = slot
-            .bindings
-            .call_process(&mut slot.store, &wire)
-            .context("call process")?;
-        let result = match call {
+        // A trap poisons the store: drop the slot (checkout builds a fresh one
+        // later). A graceful module Err leaves a perfectly reusable instance —
+        // return it to the pool, or its internal state would be lost.
+        let call = match slot.bindings.call_process(&mut slot.store, &wire) {
+            Ok(c) => c,
+            Err(trap) => return Err(trap).context("call process"),
+        };
+        self.inner.pool.lock().unwrap().push(slot);
+        match call {
             Ok(types_iface::Output::Batches(bs)) => {
                 let mut out = Vec::with_capacity(bs.len());
                 for b in &bs {
@@ -343,13 +358,7 @@ impl WasmProcessor {
                 Ok(out)
             }
             Err(msg) => Err(anyhow::anyhow!("module process error: {msg}")),
-        };
-        // Return the (still-good) instance to the pool only on success; on a
-        // trap the store is poisoned, so drop it and let checkout make a fresh one.
-        if result.is_ok() {
-            self.inner.pool.lock().unwrap().push(slot);
         }
-        result
     }
 
     fn checkout(&self) -> Result<ProcSlot> {
@@ -408,15 +417,15 @@ impl WasmSink {
         let wire = to_wire(input).map_err(|e| anyhow::anyhow!("encode input: {e}"))?;
         let mut slot = self.checkout()?;
         slot.store.set_epoch_deadline(self.deadline);
-        let call = slot
-            .bindings
-            .call_write(&mut slot.store, &wire)
-            .context("call write")?;
-        let result = call.map_err(|msg| anyhow::anyhow!("module write error: {msg}"));
-        if result.is_ok() {
-            self.inner.pool.lock().unwrap().push(slot);
-        }
-        result
+        // Trap -> drop the poisoned slot. Graceful Err -> KEEP the instance:
+        // a buffering sink (e.g. s3) holds not-yet-flushed rows in its state,
+        // and discarding it on a retryable write error would silently lose them.
+        let call = match slot.bindings.call_write(&mut slot.store, &wire) {
+            Ok(c) => c,
+            Err(trap) => return Err(trap).context("call write"),
+        };
+        self.inner.pool.lock().unwrap().push(slot);
+        call.map_err(|msg| anyhow::anyhow!("module write error: {msg}"))
     }
 
     /// Flush all pooled instances (graceful shutdown / checkpoint barrier).
@@ -493,10 +502,7 @@ pub fn build_services(
     pg_conns: HashMap<String, (String, u32)>,
     kv: Arc<dyn KvStore>,
 ) -> Result<Arc<HostServices>> {
-    let http = reqwest::Client::builder()
-        .user_agent("hyperpipe/0.1")
-        .build()
-        .context("build http client")?;
+    let http = build_http_client().context("build http client")?;
 
     let mut sql = HashMap::new();
     for (name, (dsn, max)) in pg_conns {
@@ -529,10 +535,7 @@ pub async fn build_services_async(
     blob_conns: HashMap<String, BlobConnCfg>,
     kv: Arc<dyn KvStore>,
 ) -> Result<Arc<HostServices>> {
-    let http = reqwest::Client::builder()
-        .user_agent("hyperpipe/0.1")
-        .build()
-        .context("build http client")?;
+    let http = build_http_client().context("build http client")?;
     let mut sql = HashMap::new();
     for (name, (dsn, max)) in pg_conns {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -562,10 +565,7 @@ pub async fn build_services_async(
 /// Services with no external connections (decode/stdout pipelines, tests).
 pub fn build_services_bare(handle: tokio::runtime::Handle, kv: Arc<dyn KvStore>) -> Arc<HostServices> {
     HostServices {
-        http: reqwest::Client::builder()
-            .user_agent("hyperpipe/0.1")
-            .build()
-            .expect("http client"),
+        http: build_http_client().expect("http client"),
         sql: HashMap::new(),
         blob: HashMap::new(),
         handle,

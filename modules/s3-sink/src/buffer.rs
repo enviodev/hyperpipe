@@ -113,6 +113,37 @@ impl Buffer {
         self.last_block = 0;
         Ok(Some((key, bytes)))
     }
+
+    /// Reorg rollback: drop buffered records past the fork before they ever
+    /// reach an object. Records without a parseable `block_number` are kept
+    /// (can't be judged; the sink is append-only for those anyway).
+    pub fn rollback(&mut self, invalidate_after_block: u64) {
+        self.records.retain(|r| {
+            record_block_number(r).map_or(true, |b| b <= invalidate_after_block)
+        });
+        if self.records.is_empty() {
+            self.seen = false;
+            self.first_block = 0;
+            self.last_block = 0;
+        } else {
+            self.last_block = self.last_block.min(invalidate_after_block);
+        }
+    }
+}
+
+/// A record's block number: JSON number, decimal string, or 0x-hex.
+fn record_block_number(rec: &Value) -> Option<u64> {
+    match rec.get("block_number")? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => {
+            if let Some(h) = s.strip_prefix("0x") {
+                u64::from_str_radix(h, 16).ok()
+            } else {
+                s.parse().ok()
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Per-chain buffers (§7.1). A sink fed by a multi-chain DAG (fan-in) must NOT
@@ -160,6 +191,13 @@ impl ChainBuffers {
         }
         Ok(out)
     }
+
+    /// Reorg rollback for one chain's buffer (others are untouched).
+    pub fn rollback(&mut self, chain_id: u64, invalidate_after_block: u64) {
+        if let Some(buf) = self.by_chain.get_mut(&chain_id) {
+            buf.rollback(invalidate_after_block);
+        }
+    }
 }
 
 fn to_ndjson(records: &[Value]) -> Result<Vec<u8>, String> {
@@ -171,15 +209,17 @@ fn to_ndjson(records: &[Value]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Column order = keys of the first record, sorted (deterministic).
+/// Column order = UNION of keys over all records, sorted (deterministic).
+/// Records in one buffer can differ in shape (optional fields, mixed event
+/// types); taking only the first record's keys would silently drop columns.
 fn column_order(records: &[Value]) -> Vec<String> {
-    let mut cols: Vec<String> = records
-        .first()
-        .and_then(|r| r.as_object())
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default();
-    cols.sort();
-    cols
+    let mut cols: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for r in records {
+        if let Some(o) = r.as_object() {
+            cols.extend(o.keys().cloned());
+        }
+    }
+    cols.into_iter().collect()
 }
 
 fn cell_to_string(v: Option<&Value>) -> Option<String> {
@@ -291,6 +331,53 @@ mod tests {
         let rest = cb.take_all(Format::Ndjson).unwrap();
         assert_eq!(rest.len(), 1);
         assert!(rest[0].0.starts_with("8453/"));
+    }
+
+    #[test]
+    fn parquet_schema_is_union_of_all_records() {
+        // First record lacks `amount`; a first-record-only schema would drop it.
+        let records = vec![
+            json!({ "chain_id": 1, "block_number": 100 }),
+            json!({ "chain_id": 1, "block_number": 101, "amount": "5" }),
+        ];
+        assert_eq!(column_order(&records), vec!["amount", "block_number", "chain_id"]);
+        let bytes = to_parquet(&records).unwrap();
+        assert_eq!(&bytes[0..4], b"PAR1");
+        // non-object first record must not break schema inference either
+        let mixed = vec![json!("junk"), json!({ "a": 1 })];
+        assert_eq!(column_order(&mixed), vec!["a"]);
+    }
+
+    #[test]
+    fn rollback_purges_buffered_records_past_fork() {
+        let mut cb = ChainBuffers::default();
+        cb.push(1, 100, 106, &[
+            json!({ "block_number": 100, "v": "a" }),
+            json!({ "block_number": "0x69", "v": "b" }), // 105, hex form
+            json!({ "no_block": true }),                  // unjudgeable -> kept
+        ]);
+        cb.push(8453, 500, 510, &recs(2)); // other chain untouched
+        cb.rollback(1, 102);
+
+        let all = cb.take_all(Format::Ndjson).unwrap();
+        let chain1 = all.iter().find(|(k, _)| k.starts_with("1/")).unwrap();
+        let body = String::from_utf8(chain1.1.clone()).unwrap();
+        assert!(body.contains("\"block_number\":100"));
+        assert!(!body.contains("0x69"), "reorged record must be purged");
+        assert!(body.contains("no_block"));
+        // key's last-block clamps to the fork
+        assert!(chain1.0.starts_with("1/100-102-"), "got {}", chain1.0);
+        assert!(all.iter().any(|(k, _)| k.starts_with("8453/")));
+    }
+
+    #[test]
+    fn rollback_emptying_buffer_resets_it() {
+        let mut cb = ChainBuffers::default();
+        cb.push(1, 100, 110, &[json!({ "block_number": 105 })]);
+        cb.rollback(1, 90);
+        assert!(cb.take_all(Format::Ndjson).unwrap().is_empty());
+        // rollback on an unknown chain is a no-op
+        cb.rollback(999, 0);
     }
 
     #[test]

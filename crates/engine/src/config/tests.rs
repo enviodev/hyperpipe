@@ -57,6 +57,66 @@ fn good_config_parses_and_validates() {
 }
 
 #[test]
+fn reorg_defaults_to_enabled_with_window_64() {
+    let cfg = load(GOOD).unwrap();
+    assert!(cfg.sources[0].reorg.enabled);
+    assert_eq!(cfg.sources[0].reorg.window, 64);
+}
+
+#[test]
+fn reorg_block_parses() {
+    let s = GOOD.replace(
+        "    mode: live\n",
+        "    mode: live\n    reorg:\n      enabled: false\n",
+    );
+    let cfg = load(&s).unwrap();
+    assert!(!cfg.sources[0].reorg.enabled);
+
+    let s = GOOD.replace(
+        "    mode: live\n",
+        "    mode: live\n    reorg:\n      window: 200\n",
+    );
+    let cfg = load(&s).unwrap();
+    assert!(cfg.sources[0].reorg.enabled);
+    assert_eq!(cfg.sources[0].reorg.window, 200);
+}
+
+#[test]
+fn err_reorg_window_bounds() {
+    let s = GOOD.replace(
+        "    mode: live\n",
+        "    mode: live\n    reorg:\n      window: 0\n",
+    );
+    let err = load(&s).unwrap_err();
+    assert!(err.to_string().contains("reorg.window"), "got {err}");
+
+    let s = GOOD.replace(
+        "    mode: live\n",
+        "    mode: live\n    reorg:\n      window: 999999\n",
+    );
+    let err = load(&s).unwrap_err();
+    assert!(err.to_string().contains("too large"), "got {err}");
+}
+
+#[test]
+fn err_unprotected_head_ingestion() {
+    // confirmations: 0 (at head) + reorg tracking off = corrupt data on any
+    // reorg with no recovery path; refuse the combination for live sources.
+    let s = GOOD.replace(
+        "    mode: live\n",
+        "    mode: live\n    confirmations: 0\n    reorg:\n      enabled: false\n",
+    );
+    let err = load(&s).unwrap_err();
+    assert!(err.to_string().contains("confirmations"), "got {err}");
+    // safe-distance users: high confirmations with tracking off is fine
+    let s = GOOD.replace(
+        "    mode: live\n",
+        "    mode: live\n    confirmations: 100\n    reorg:\n      enabled: false\n",
+    );
+    assert!(load(&s).is_ok());
+}
+
+#[test]
 fn err_unknown_key_is_rejected() {
     let s = GOOD.replace("resource_size: m", "resource_size: m\n  bogus_key: 3");
     let err = load(&s).unwrap_err();

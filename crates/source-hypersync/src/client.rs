@@ -15,6 +15,12 @@ pub struct HyperSyncClient {
     token: Option<String>,
     logs: Vec<LogSelWire>,
     field_selection: FieldSelWire,
+    /// Whether the user's block field_selection asked for timestamp/hash —
+    /// controls which block fields get denormalized into log records. The wire
+    /// selection may request more (reorg tracking force-adds number+hash), but
+    /// record shape must follow the user's config only.
+    join_ts: bool,
+    join_hash: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -42,7 +48,25 @@ struct QueryReq {
     to_block: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     logs: Vec<LogSelWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_all_blocks: Option<bool>,
     field_selection: FieldSelWire,
+}
+
+/// HyperSync's reorg-detection metadata, present when a response covers blocks
+/// near the chain tip (see docs.envio.dev → HyperSync query → rollback guard).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackGuard {
+    /// Last block scanned in this query.
+    pub block_number: u64,
+    /// Hash of the last block scanned.
+    pub hash: String,
+    /// First block scanned in this query.
+    pub first_block_number: u64,
+    /// Parent hash of the first block scanned (= hash of `first_block_number - 1`).
+    pub first_parent_hash: String,
+    /// Timestamp of the last block scanned.
+    pub timestamp: Option<u64>,
 }
 
 /// Parsed, denormalized response: log records with block metadata joined in.
@@ -50,10 +74,16 @@ pub struct QueryResponse {
     pub archive_height: Option<u64>,
     pub next_block: u64,
     pub records: Vec<Value>,
+    /// (block_number, block_hash) for every block in the response `data`.
+    pub block_hashes: Vec<(u64, String)>,
+    pub rollback_guard: Option<RollbackGuard>,
 }
 
 impl HyperSyncClient {
-    pub fn new(base_url: String, token: Option<String>, query: &Query) -> Self {
+    /// `track_blocks` force-adds `number`+`hash` to the wire block selection so
+    /// reorg tracking always has hashes to work with; record shape still
+    /// follows the user's own field_selection.
+    pub fn new(base_url: String, token: Option<String>, query: &Query, track_blocks: bool) -> Self {
         let base = base_url.trim_end_matches('/').to_string();
         let logs = query
             .logs
@@ -63,14 +93,28 @@ impl HyperSyncClient {
                 topics: l.topics.clone(),
             })
             .collect();
+        let join_ts = query.field_selection.block.iter().any(|f| f == "timestamp");
+        let join_hash = query.field_selection.block.iter().any(|f| f == "hash");
+        let mut block_sel = query.field_selection.block.clone();
+        if track_blocks {
+            for required in ["number", "hash"] {
+                if !block_sel.iter().any(|f| f == required) {
+                    block_sel.push(required.to_string());
+                }
+            }
+        }
         let field_selection = FieldSelWire {
             log: query.field_selection.log.clone(),
-            block: query.field_selection.block.clone(),
+            block: block_sel,
             transaction: query.field_selection.transaction.clone(),
         };
         HyperSyncClient {
+            // Timeouts keep the cursor loop's retry/backoff in charge: a hung
+            // connection must surface as an Err, not wedge the source forever.
             http: reqwest::Client::builder()
                 .user_agent("hyperpipe/0.1")
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .expect("http client"),
             query_url: format!("{base}/query"),
@@ -78,6 +122,8 @@ impl HyperSyncClient {
             token,
             logs,
             field_selection,
+            join_ts,
+            join_hash,
         }
     }
 
@@ -107,11 +153,46 @@ impl HyperSyncClient {
             from_block,
             to_block,
             logs: self.logs.clone(),
+            include_all_blocks: None,
             field_selection: self.field_selection.clone(),
         };
+        let body = self.post_query(&req).await?;
+        parse_response(&body, from_block, self.join_ts, self.join_hash)
+    }
+
+    /// Canonical block hashes for `[from, to)` — a headers-only query used to
+    /// locate the fork point after a reorg. Pages through `next_block` until
+    /// the range is covered; bails out if the server stops advancing.
+    pub async fn block_hashes(&self, from: u64, to: u64) -> Result<Vec<(u64, String)>> {
+        let mut out = Vec::new();
+        let mut cursor = from;
+        while cursor < to {
+            let req = QueryReq {
+                from_block: cursor,
+                to_block: Some(to),
+                logs: Vec::new(),
+                include_all_blocks: Some(true),
+                field_selection: FieldSelWire {
+                    log: Vec::new(),
+                    block: vec!["number".into(), "hash".into()],
+                    transaction: Vec::new(),
+                },
+            };
+            let body = self.post_query(&req).await?;
+            let resp = parse_response(&body, cursor, false, false)?;
+            out.extend(resp.block_hashes);
+            if resp.next_block <= cursor {
+                break; // server made no progress; return what we have
+            }
+            cursor = resp.next_block;
+        }
+        Ok(out)
+    }
+
+    async fn post_query(&self, req: &QueryReq) -> Result<Value> {
         let resp = self
             .auth(self.http.post(&self.query_url))
-            .json(&req)
+            .json(req)
             .send()
             .await
             .context("query request")?;
@@ -124,13 +205,15 @@ impl HyperSyncClient {
                 .unwrap_or("unknown error");
             return Err(anyhow!("hypersync {status}: {msg}"));
         }
-        parse_response(&body, from_block)
+        Ok(body)
     }
 }
 
 /// Parse a `/query` response body into denormalized log records. Tolerant of
 /// `data` being either an object `{logs,blocks,...}` or an array of such objects.
-fn parse_response(body: &Value, from_block: u64) -> Result<QueryResponse> {
+/// `join_ts`/`join_hash` gate which block fields get copied into log records
+/// (only the ones the user's field_selection actually asked for).
+fn parse_response(body: &Value, from_block: u64, join_ts: bool, join_hash: bool) -> Result<QueryResponse> {
     let archive_height = body.get("archive_height").and_then(|v| v.as_u64());
     let next_block = body
         .get("next_block")
@@ -167,10 +250,10 @@ fn parse_response(body: &Value, from_block: u64) -> Result<QueryResponse> {
         if let Some(bn) = flex_u64(log.get("block_number")) {
             if let Some((ts, hash)) = blocks.get(&bn) {
                 if let Some(obj) = log.as_object_mut() {
-                    if let Some(ts) = ts {
+                    if let (true, Some(ts)) = (join_ts, ts) {
                         obj.entry("block_timestamp").or_insert(Value::from(*ts));
                     }
-                    if let Some(hash) = hash {
+                    if let (true, Some(hash)) = (join_hash, hash) {
                         obj.entry("block_hash").or_insert(Value::from(hash.clone()));
                     }
                 }
@@ -178,10 +261,31 @@ fn parse_response(body: &Value, from_block: u64) -> Result<QueryResponse> {
         }
     }
 
+    let block_hashes: Vec<(u64, String)> = blocks
+        .iter()
+        .filter_map(|(num, (_, hash))| hash.clone().map(|h| (*num, h)))
+        .collect();
+
     Ok(QueryResponse {
         archive_height,
         next_block,
         records: logs,
+        block_hashes,
+        rollback_guard: parse_rollback_guard(body.get("rollback_guard")),
+    })
+}
+
+/// Parse the optional `rollback_guard` object. Tolerant of numeric fields
+/// arriving as numbers, decimal strings, or 0x-hex; returns None if the guard
+/// is absent or missing any required field.
+fn parse_rollback_guard(v: Option<&Value>) -> Option<RollbackGuard> {
+    let g = v?.as_object()?;
+    Some(RollbackGuard {
+        block_number: flex_u64(g.get("block_number"))?,
+        hash: g.get("hash")?.as_str()?.to_string(),
+        first_block_number: flex_u64(g.get("first_block_number"))?,
+        first_parent_hash: g.get("first_parent_hash")?.as_str()?.to_string(),
+        timestamp: flex_u64(g.get("timestamp")),
     })
 }
 
@@ -215,13 +319,64 @@ mod tests {
                 "logs": [{"address":"0xusdc","topic0":"0xddf2","block_number":19000005,"log_index":3}]
             }
         });
-        let r = parse_response(&body, 19000000).unwrap();
+        let r = parse_response(&body, 19000000, true, true).unwrap();
         assert_eq!(r.next_block, 19000006);
         assert_eq!(r.archive_height, Some(19000100));
         assert_eq!(r.records.len(), 1);
         let log = &r.records[0];
         assert_eq!(log["block_hash"], "0xblockhash");
         assert_eq!(log["block_timestamp"], 0x655a1234u64);
+        assert_eq!(r.block_hashes, vec![(19000005, "0xblockhash".to_string())]);
+    }
+
+    #[test]
+    fn join_flags_gate_denormalized_fields() {
+        // Reorg tracking force-selects block hash on the wire, but the user did
+        // not ask for it: records must NOT grow a block_hash field.
+        let body = json!({
+            "next_block": 100,
+            "data": {
+                "blocks": [{"number": 10, "timestamp": 111, "hash": "0xa"}],
+                "logs": [{"block_number": 10, "log_index": 0}]
+            }
+        });
+        let r = parse_response(&body, 0, true, false).unwrap();
+        assert_eq!(r.records[0]["block_timestamp"], 111);
+        assert!(r.records[0].get("block_hash").is_none());
+        // hashes are still available for the reorg tracker
+        assert_eq!(r.block_hashes, vec![(10, "0xa".to_string())]);
+    }
+
+    #[test]
+    fn parses_rollback_guard() {
+        let body = json!({
+            "next_block": 105,
+            "data": { "logs": [] },
+            "rollback_guard": {
+                "block_number": 104,
+                "timestamp": "0x655a1234",
+                "hash": "0xtip",
+                "first_block_number": 100,
+                "first_parent_hash": "0xparent"
+            }
+        });
+        let g = parse_response(&body, 100, true, true).unwrap().rollback_guard.unwrap();
+        assert_eq!(g.block_number, 104);
+        assert_eq!(g.hash, "0xtip");
+        assert_eq!(g.first_block_number, 100);
+        assert_eq!(g.first_parent_hash, "0xparent");
+        assert_eq!(g.timestamp, Some(0x655a1234));
+    }
+
+    #[test]
+    fn absent_or_malformed_rollback_guard_is_none() {
+        let none = parse_response(&json!({"data": {"logs": []}}), 0, true, true).unwrap();
+        assert!(none.rollback_guard.is_none());
+        // missing required field -> None, not a parse error
+        let partial = json!({"data": {"logs": []}, "rollback_guard": {"block_number": 5}});
+        assert!(parse_response(&partial, 0, true, true).unwrap().rollback_guard.is_none());
+        let not_obj = json!({"data": {"logs": []}, "rollback_guard": null});
+        assert!(parse_response(&not_obj, 0, true, true).unwrap().rollback_guard.is_none());
     }
 
     #[test]
@@ -235,7 +390,7 @@ mod tests {
                 { "blocks": [], "logs": [{"block_number": 10, "log_index": 1}] }
             ]
         });
-        let r = parse_response(&body, 0).unwrap();
+        let r = parse_response(&body, 0, true, true).unwrap();
         assert_eq!(r.records.len(), 2);
         assert_eq!(r.records[0]["block_timestamp"], 111);
         // second log shares block 10 metadata via the map
@@ -245,7 +400,7 @@ mod tests {
     #[test]
     fn missing_next_block_defaults_to_from() {
         let body = json!({ "data": { "logs": [] } });
-        let r = parse_response(&body, 555).unwrap();
+        let r = parse_response(&body, 555, true, true).unwrap();
         assert_eq!(r.next_block, 555);
         assert!(r.records.is_empty());
     }
