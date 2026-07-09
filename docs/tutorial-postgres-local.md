@@ -1,17 +1,16 @@
-# Tutorial: HyperPipe → Postgres, all local
+# Tutorial: HyperPipe → Postgres, on your machine
 
-Stream blockchain `Transfer` events through the engine, decode them with the WASM
-ABI decoder, and land them in a **local Postgres** — with **no HyperSync token and no
-cloud**. A built-in mock server plays the role of HyperSync, so you can watch the whole
-decode → upsert path work on your laptop in a couple of minutes.
+Stream real blockchain `Transfer` events from **Envio HyperSync**, decode them with the
+WASM ABI decoder, and land them in a **local Postgres**. The engine, modules, and database
+all run on your laptop; only the chain data comes over the network.
 
-At the end you'll also see the live path (real chains → Postgres), which is the same
-pipeline with two values swapped.
+You'll backfill a small block range first (it finishes and exits, so you can inspect the
+rows), then flip one setting to follow the chain head live.
 
 ```
-mock HyperSync ──▶ engine ──▶ evm-abi-decoder (WASM) ──▶ postgres sink (WASM) ──▶ Postgres
-   (scripts/          (auto-decodes ERC-20 Transfer)      (auto-DDL + upsert)     (docker)
-    mock-hypersync.py)
+Envio HyperSync ──▶ engine ──▶ evm-abi-decoder (WASM) ──▶ postgres sink (WASM) ──▶ Postgres
+  (real chains,       (auto-decodes ERC-20 Transfer)      (auto-DDL + upsert)     (docker)
+   your API token)
 ```
 
 ---
@@ -21,9 +20,7 @@ mock HyperSync ──▶ engine ──▶ evm-abi-decoder (WASM) ──▶ postg
 - **Rust** ≥ 1.85 (`rustup` picks the pinned toolchain automatically)
 - the **wasm32-wasip2** target — `rustup target add wasm32-wasip2`
 - **Docker** (for the local Postgres)
-- **Python 3** (runs the offline mock server)
-
-No HyperSync token needed for this tutorial.
+- a **HyperSync API token** — create one at <https://app.envio.dev/api-tokens>
 
 ## 1. Build
 
@@ -63,7 +60,7 @@ postgres://postgres:hp@localhost:5433/hp
 
 ## 3. Write the pipeline
 
-One YAML declares the source (mock), the decoder, and the Postgres sink. Save as
+One YAML declares the source (Ethereum USDC), the decoder, and the Postgres sink. Save as
 `local-pg.yaml` in the repo root.
 
 > The heredoc is **unquoted** so `$PWD` expands to an absolute ABI path — relative
@@ -82,14 +79,13 @@ runtime:
     path: ./state/local-pg.db
 
 sources:
-  - name: eth
+  - name: eth_usdc
     type: hypersync
-    chain_id: 1
-    url: http://127.0.0.1:8799     # the mock server (step 4)
+    chain: ethereum                # built-in chain registry name
     mode: backfill                 # fixed range -> exits at the end (job mode)
     from_block: 19000000
-    to_block: 19000050
-    confirmations: 0               # mock is deterministic; no head to lag behind
+    to_block: 19000005             # small range; a few dozen real transfers
+    confirmations: 0               # this range is long final, no need to lag the head
     reorg: { enabled: false }      # allowed for backfill; off keeps this minimal
     query:
       logs:
@@ -102,7 +98,7 @@ sources:
 processors:
   - name: decode
     module: builtin/evm-abi-decoder@1
-    inputs: [eth]
+    inputs: [eth_usdc]
     config:
       abis:
         - file: $PWD/examples/abis/erc20.json
@@ -139,17 +135,11 @@ breaks YAML parsing.
 
 ## 4. Run it
 
-Three env vars, then validate and run. Terminal 1 = mock, terminal 2 = engine.
-
-**Terminal 1** — the mock HyperSync server (one USDC Transfer per block, `value == block_number`):
-
-```bash
-PORT=8799 python3 scripts/mock-hypersync.py
-```
-
-**Terminal 2** — point at the modules + the DSN, validate, run:
+Three env vars — the HyperSync token, the module dir, and the DSN secret — then validate
+and run:
 
 ```bash
+export HYPERSYNC_BEARER_TOKEN='<your token from app.envio.dev/api-tokens>'
 export HYPERPIPE_MODULE_DIR="$PWD/modules/target/wasm32-wasip2/debug"
 export HYPERPIPE_SECRET_PG_MAIN_DSN='postgres://postgres:hp@localhost:5433/hp'
 export RUST_LOG=hyperpipe=info
@@ -158,66 +148,66 @@ export RUST_LOG=hyperpipe=info
 ./target/debug/hyperpipe run     local-pg.yaml
 ```
 
-You'll see the engine log a loud `CREATE TABLE` (auto-DDL), stream the range, then:
+Keep the token out of the YAML and out of your shell history — export it in the session,
+or put it in an env file (step 7). The engine logs a loud `CREATE TABLE` (auto-DDL),
+streams the range, then:
 
 ```
 pipeline finished (all sources reached EOF)
 ```
 
-and exit 0 — backfill is job mode. Stop the mock in terminal 1 with ctrl-c.
+and exits 0 — backfill is job mode.
 
 ## 5. See the rows
 
-The sink auto-created the table and upserted 50 rows (blocks 19000000–19000049 —
-`to_block` is the exclusive upper bound):
+The sink auto-created the table and upserted the real transfers in blocks
+19000000–19000004 (`to_block` is the exclusive upper bound):
 
 ```bash
 docker exec hp-pg psql -U postgres -d hp -c "SELECT count(*) FROM usdc_transfers;"
 
 docker exec hp-pg psql -U postgres -d hp -c \
-  "SELECT chain_id, block_number, log_index, from_address, amount
-   FROM usdc_transfers ORDER BY block_number LIMIT 5;"
+  "SELECT block_number, log_index, from_address, to_address, amount
+   FROM usdc_transfers ORDER BY block_number, log_index LIMIT 5;"
 ```
 
-Because the mock encodes `value == block_number`, the `amount` column equals
-`block_number` — an easy end-to-end correctness check. The schema was inferred from the
-data (`bigint`, `numeric`, `text`), with the primary key on your `unique_key`:
+You'll get a few dozen rows of genuine on-chain USDC transfers — real addresses, real
+amounts (USDC has 6 decimals, so `500000000` = 500 USDC). The schema was inferred from
+the data (`bigint`, `numeric`, `text`), with the primary key on your `unique_key`:
 
 ```
- chain_id | block_number | log_index |               from_address                |  amount
-----------+--------------+-----------+-------------------------------------------+----------
-        1 |     19000000 |         0 | 0xaAaAaAaaAaAaAaaAaA...                    | 19000000
-        1 |     19000001 |         0 | 0xaAaAaAaaAaAaAaaAaA...                    | 19000001
+ block_number | log_index |               from_address                |               to_address                 |  amount
+--------------+-----------+-------------------------------------------+------------------------------------------+-----------
+     19000000 |       116 | 0xbD098c9B3b2cffeE0083725f3545e604dD9d8De7 | 0x2Fc617E933a52713247CE25730f6695920B3befe| 500000000
+     19000000 |       221 | 0xB9254341A08dA44F31B60851f038192140365e00 | 0x1ac1A8FEaAEa1900C4166dEeed0C11cC10669D36|  44042190
 ```
 
 ## 6. Prove idempotency (optional)
 
-Delete the checkpoint and re-run — the upsert means **no duplicates**, count stays put:
+Delete the checkpoint and re-run — the upsert means **no duplicates**, the count stays put:
 
 ```bash
 rm -f state/local-pg.db          # forget where we were
-# (restart the mock in terminal 1, then re-run the engine)
 ./target/debug/hyperpipe run local-pg.yaml
-docker exec hp-pg psql -U postgres -d hp -tAc "SELECT count(*) FROM usdc_transfers;"   # still 50
+docker exec hp-pg psql -U postgres -d hp -tAc "SELECT count(*) FROM usdc_transfers;"   # unchanged
 ```
 
 If you *don't* delete the checkpoint, the re-run resumes past the range and exits
 immediately with nothing to do — that's crash-recovery working.
 
-## 7. Going live (real chains → same Postgres)
+## 7. Follow the chain live
 
-The offline path and the live path are the *same* pipeline. To hit real Ethereum instead
-of the mock:
+Backfill was a bounded job. To keep ingesting new blocks forever, change the source to
+live mode:
 
-1. Get a HyperSync token → <https://app.envio.dev/api-tokens>, then
-   `export HYPERSYNC_BEARER_TOKEN=...`.
-2. In the source: drop `url:` + `chain_id:`, use `chain: ethereum`; switch
-   `mode: backfill` → `mode: live` and delete `to_block`; set `confirmations: 10` and
-   `reorg: { enabled: true }` (safe against reorgs — the sink can undo forked rows if you
-   add `rollback: true` to its config).
+- `mode: backfill` → `mode: live`, and **delete `to_block`** (live has no end),
+- `confirmations: 0` → `confirmations: 10` (lag the head so short reorgs never reach you),
+- `reorg: { enabled: false }` → `reorg: { enabled: true }` (track block hashes; add
+  `rollback: true` to the sink's `config` and it deletes forked rows on a reorg).
 
-That is exactly [`examples/usdc-postgres.yaml`](../examples/usdc-postgres.yaml). Run it with
-the launcher (builds anything missing, loads the env file, validates, runs):
+That is exactly [`examples/usdc-postgres.yaml`](../examples/usdc-postgres.yaml). Instead of
+exporting vars by hand, use an env file + the launcher (it builds anything missing, loads
+the file, validates, runs):
 
 ```bash
 cp examples/pipeline.env.example pipeline.env
@@ -225,13 +215,14 @@ $EDITOR pipeline.env             # HYPERSYNC_BEARER_TOKEN + HYPERPIPE_SECRET_PG_
 ./scripts/run.sh examples/usdc-postgres.yaml pipeline.env
 ```
 
-`live` follows the head forever — stop it with ctrl-c (it drains cleanly).
+`pipeline.env` is gitignored — the token lives there, not in the YAML. `live` follows the
+head forever; stop it with ctrl-c (it drains cleanly).
 
 **One-command alternative** — `deploy/docker-compose.yaml` brings up Postgres *and* the
 pipeline together (only needs a token in `deploy/hyperpipe.env`):
 
 ```bash
-echo "HYPERSYNC_BEARER_TOKEN=..." > deploy/hyperpipe.env
+echo "HYPERSYNC_BEARER_TOKEN=<your token>" > deploy/hyperpipe.env
 cp examples/usdc-postgres.yaml deploy/pipeline.yaml
 docker compose -f deploy/docker-compose.yaml up --build
 ```
@@ -247,13 +238,12 @@ rm -f local-pg.yaml state/local-pg.db
 
 | Symptom | Cause / fix |
 |---|---|
+| `hypersync 401` | `HYPERSYNC_BEARER_TOKEN` unset or invalid. Create one at <https://app.envio.dev/api-tokens>. |
 | `read builtin ... build modules first` | Modules not built or `HYPERPIPE_MODULE_DIR` wrong. Run `./scripts/build-modules.sh` and re-export the dir. |
 | `unresolved secrets: PG_MAIN_DSN` | Export `HYPERPIPE_SECRET_PG_MAIN_DSN=...` before running. |
 | Connection refused / can't reach Postgres | Container not up, or wrong port. `docker exec hp-pg pg_isready -U postgres`; DSN host port must be **5433**. |
 | Pipeline exits immediately, table empty | Left-over checkpoint from a prior run — `rm state/local-pg.db` to replay. |
-| Source logs `connection refused` on 8799 | Mock server not running (terminal 1) or a different `PORT`. |
 | YAML parse error at `${secret:...}` | Put the secret ref on its own line (block style), never inside a `{ ... }` flow map. |
-| `hypersync 401` (live only) | `HYPERSYNC_BEARER_TOKEN` missing/invalid. |
 
 ## Where to go next
 
