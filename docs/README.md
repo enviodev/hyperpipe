@@ -9,6 +9,7 @@ sandboxes every module, and recovers with at-least-once delivery.
 | You want to… | Read |
 |---|---|
 | Build and run your first pipeline | [getting-started.md](./getting-started.md) |
+| Land real chain data in a local Postgres, step by step | [tutorial-postgres-local.md](./tutorial-postgres-local.md) |
 | Write or tweak a pipeline YAML | [pipeline-reference.md](./pipeline-reference.md) |
 | Configure a specific built-in module (decoder, postgres, s3, …) | [modules.md](./modules.md) |
 | Write your own WASM module | [modules.md § Authoring custom modules](./modules.md#authoring-custom-modules) |
