@@ -12,8 +12,15 @@ build-modules:
 build-modules-release:
     cd modules && cargo build --target wasm32-wasip2 --release --workspace --exclude test-chaos
 
+# The out-of-tree example module (its own workspace — the template a user copies).
+# Not part of `modules/`, so nothing else builds it; scripts/e2e/08 needs the
+# .wasm, which is gitignored build output.
+build-example-module:
+    cd examples/modules/enrich && cargo build --target wasm32-wasip2 --release
+    cp examples/modules/enrich/target/wasm32-wasip2/release/enrich.wasm examples/modules/enrich.wasm
+
 # Everything.
-build-all: build build-modules
+build-all: build build-modules build-example-module
 
 # Native tests (config, encoding, source, host integration) + guest module unit tests.
 # Set HP_TEST_PG_DSN to also run the postgres-backed tests (they soft-skip without it):
@@ -25,7 +32,7 @@ test: build-modules
 
 # End-to-end suite: real binary, real wasm, scripted HyperSync, real Postgres.
 # See docs/E2E_TEST_PLAN.md. `just e2e --only 05` runs one scenario.
-e2e *ARGS: build build-modules
+e2e *ARGS: build build-modules build-example-module
     ./scripts/e2e/run-all.sh {{ARGS}}
 
 # Coverage for both workspaces (needs: cargo install cargo-llvm-cov).

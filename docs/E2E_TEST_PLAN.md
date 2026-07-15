@@ -254,6 +254,7 @@ jobs:
     steps:
       - rustup target add wasm32-wasip2
       - cd modules && cargo build --target wasm32-wasip2
+      - just build-example-module                  # E2E-08; its .wasm is gitignored output
       - cargo llvm-cov clean --workspace
       - cargo llvm-cov --workspace --no-report     # unit + integration (TEST_PLAN §5–6)
       - ./scripts/e2e/run-all.sh --instrumented    # this doc; merges into the above
