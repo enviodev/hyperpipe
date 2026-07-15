@@ -11,6 +11,7 @@ members = [
     "webhook-sink",
     "postgres-sink",
     "s3-sink",
+    "test-chaos",
 ]
 
 [workspace.package]

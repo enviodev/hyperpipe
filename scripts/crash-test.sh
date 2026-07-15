@@ -4,6 +4,8 @@
 # exactly once (idempotent upsert). Requires the `hp-pg` container from the demo.
 #
 # Usage: ./scripts/crash-test.sh
+#   PG_CONTAINER / PG_DSN / PG_USER / PG_DB override the postgres target
+#   (same knobs as reorg-test.sh; scripts/e2e/03 passes its own).
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,15 +13,18 @@ PORT=8799
 FROM=19000000
 BLOCKS=300
 TO=$((FROM + BLOCKS))
-PG_DSN="postgres://postgres:hp@127.0.0.1:5433/hp"
+PG_CONTAINER="${PG_CONTAINER:-hp-pg}"
+PG_USER="${PG_USER:-postgres}"
+PG_DB="${PG_DB:-hp}"
+PG_DSN="${PG_DSN:-postgres://postgres:hp@127.0.0.1:5436/hp}"
 
 export HYPERPIPE_MODULE_DIR="$ROOT/modules/target/wasm32-wasip2/debug"
 export HYPERPIPE_SECRET_PG_DSN="$PG_DSN"
 export RUST_LOG=hyperpipe=error
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
-docker exec hp-pg pg_isready -U postgres >/dev/null 2>&1 || {
-  echo "start postgres first: docker run -d --name hp-pg -e POSTGRES_PASSWORD=hp -e POSTGRES_DB=hp -p 5433:5432 postgres:16-alpine"
+docker exec "$PG_CONTAINER" pg_isready -U "$PG_USER" >/dev/null 2>&1 || {
+  echo "start postgres first: docker run -d --name $PG_CONTAINER -e POSTGRES_PASSWORD=hp -e POSTGRES_DB=$PG_DB -p 5436:5432 postgres:16-alpine"
   exit 1
 }
 
@@ -29,7 +34,7 @@ BIN="$ROOT/target/debug/hyperpipe"
 WORK=/tmp/hpcrash
 rm -rf "$WORK"; mkdir -p "$WORK"
 cp "$ROOT/examples/abis/erc20.json" "$WORK/erc20.json"
-docker exec hp-pg psql -U postgres -d hp -c "DROP TABLE IF EXISTS crash_test;" >/dev/null
+docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -c "DROP TABLE IF EXISTS crash_test;" >/dev/null
 
 cat > "$WORK/pipe.yaml" <<YAML
 name: crash-test
@@ -74,7 +79,7 @@ MOCK=$!
 trap 'kill $MOCK 2>/dev/null' EXIT
 sleep 1
 
-pg_count() { docker exec hp-pg psql -U postgres -d hp -tAc "SELECT count(*) FROM crash_test;" 2>/dev/null | tr -d '[:space:]'; }
+pg_count() { docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "SELECT count(*) FROM crash_test;" 2>/dev/null | tr -d '[:space:]'; }
 
 count=0; iter=0; kills=0
 while [ "${count:-0}" -lt "$BLOCKS" ] && [ "$iter" -lt 15 ]; do
@@ -96,7 +101,7 @@ done
 # one clean run to guarantee EOF
 "$BIN" run "$WORK/pipe.yaml" >/dev/null 2>&1
 count=$(pg_count)
-distinct=$(docker exec hp-pg psql -U postgres -d hp -tAc "SELECT count(DISTINCT block_number) FROM crash_test;" | tr -d '[:space:]')
+distinct=$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "SELECT count(DISTINCT block_number) FROM crash_test;" | tr -d '[:space:]')
 
 echo "----------------------------------------"
 if [ "$count" = "$BLOCKS" ] && [ "$distinct" = "$BLOCKS" ]; then

@@ -72,6 +72,77 @@ pub fn encode_batch(b: &Batch) -> Result<Vec<u8>, String> {
     hp_encoding::encode(Encoding::Json, b).map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn batch() -> Batch {
+        Batch::new(
+            "eth",
+            1,
+            BlockRange(100, 200),
+            0,
+            BatchKind::Log,
+            vec![json!({ "value": "5000000000000" })],
+        )
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let b = batch();
+        let wire = encode_batch(&b).unwrap();
+        let back = decode_batch(Encoding::Json.as_u8(), &wire).unwrap();
+        assert_eq!(back.batch_id, b.batch_id);
+        assert_eq!(back.block_range, b.block_range);
+        assert_eq!(back.records[0]["value"], "5000000000000");
+    }
+
+    #[test]
+    fn decode_batch_rejects_an_unknown_tag() {
+        let wire = encode_batch(&batch()).unwrap();
+        let e = decode_batch(9, &wire).err().unwrap();
+        assert_eq!(e, "unknown encoding tag 9");
+    }
+
+    #[test]
+    fn decode_batch_rejects_unwired_encodings() {
+        let wire = encode_batch(&batch()).unwrap();
+        // Tags 1 (cbor) and 2 (arrow-ipc) are valid in the WIT enum but not
+        // implemented — the module must say so rather than mis-parse.
+        for tag in [1u8, 2u8] {
+            let e = decode_batch(tag, &wire).err().unwrap();
+            assert!(e.contains("unsupported encoding"), "tag {tag}: {e}");
+        }
+    }
+
+    #[test]
+    fn decode_batch_reports_malformed_payloads() {
+        let e = decode_batch(0, b"{ not json").err().unwrap();
+        assert!(e.starts_with("json: "), "got {e}");
+    }
+
+    #[test]
+    fn lock_state_recovers_from_a_poisoned_mutex() {
+        // A guest panic inside `process` traps the instance, but a surviving
+        // instance must not turn every later call into a poison panic.
+        let m = std::sync::Arc::new(std::sync::Mutex::new(vec![1u8]));
+        let m2 = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("poison it");
+        })
+        .join();
+        assert!(m.lock().is_err(), "the mutex should now be poisoned");
+
+        let mut guard = lock_state(&m);
+        assert_eq!(*guard, vec![1u8], "state survives the poisoning");
+        guard.push(2);
+        drop(guard);
+        assert_eq!(*lock_state(&m), vec![1u8, 2]);
+    }
+}
+
 /// Wire a [`Processor`] type to the `processor` world's component exports.
 #[macro_export]
 macro_rules! export_processor {

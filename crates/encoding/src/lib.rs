@@ -349,4 +349,83 @@ mod tests {
         assert_eq!(b.ack_block, None);
         assert_eq!(b.ack_block(), 2);
     }
+
+    #[test]
+    fn unwired_encodings_are_unsupported_both_directions() {
+        let b = Batch::new("s", 1, BlockRange(1, 2), 0, BatchKind::Log, vec![]);
+        for enc in [Encoding::Cbor, Encoding::ArrowIpc] {
+            match encode(enc, &b) {
+                Err(CodecError::Unsupported(got)) => assert_eq!(got, enc),
+                other => panic!("encode {enc:?} should be unsupported, got {other:?}"),
+            }
+            match decode(enc, b"anything") {
+                Err(CodecError::Unsupported(got)) => assert_eq!(got, enc),
+                other => panic!("decode {enc:?} should be unsupported, got {:?}", other.err()),
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_json_is_a_codec_error() {
+        let e = decode(Encoding::Json, b"{not json").unwrap_err();
+        assert!(matches!(e, CodecError::Json(_)), "got {e:?}");
+        assert!(e.to_string().starts_with("json: "));
+    }
+
+    #[test]
+    fn rollback_control_batch_shape() {
+        let b = Batch::control(
+            "eth",
+            8453,
+            ControlRecord::Rollback {
+                chain_id: 8453,
+                invalidate_after_block: 19_000_000,
+            },
+        );
+        // The control block "at" is the fork block, and the range collapses onto it.
+        assert_eq!(b.batch_id, "eth:ctrl:19000000");
+        assert_eq!(b.block_range, BlockRange(19_000_000, 19_000_000));
+        assert_eq!(b.chain_id, 8453);
+        assert!(b.is_control());
+        assert_eq!(
+            b.as_control(),
+            Some(ControlRecord::Rollback {
+                chain_id: 8453,
+                invalidate_after_block: 19_000_000
+            })
+        );
+        // ...and survives the wasm boundary.
+        let back = decode(Encoding::Json, &encode(Encoding::Json, &b).unwrap()).unwrap();
+        assert_eq!(back.as_control(), b.as_control());
+    }
+
+    #[test]
+    fn as_control_is_none_for_non_control_and_junk() {
+        let data = Batch::new("s", 1, BlockRange(1, 2), 0, BatchKind::Log, vec![json!({"control":"eof"})]);
+        assert_eq!(data.as_control(), None, "kind gates the parse, not the record");
+
+        // Control kind but a record that is not a ControlRecord.
+        let mut junk = Batch::control("s", 1, ControlRecord::Eof { source: "s".into(), at_block: 1 });
+        junk.records = vec![json!({"control": "not-a-variant"})];
+        assert_eq!(junk.as_control(), None);
+
+        // Control kind with no record at all.
+        junk.records.clear();
+        assert_eq!(junk.as_control(), None);
+    }
+
+    #[test]
+    fn block_range_and_len_accessors() {
+        let r = BlockRange(100, 250);
+        assert_eq!(r.from(), 100);
+        assert_eq!(r.to(), 250);
+
+        let empty = Batch::new("s", 1, r, 0, BatchKind::Log, vec![]);
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+
+        let full = Batch::new("s", 1, r, 0, BatchKind::Log, vec![json!(1), json!(2)]);
+        assert_eq!(full.len(), 2);
+        assert!(!full.is_empty());
+    }
 }

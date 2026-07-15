@@ -1,0 +1,15 @@
+[package]
+name = "test-chaos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deliberately misbehaving guest module. Test fixture only — never ship it."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hyperpipe-sdk = { workspace = true }
+wit-bindgen = { workspace = true }
+serde_json = { workspace = true }

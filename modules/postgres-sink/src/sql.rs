@@ -391,4 +391,173 @@ mod tests {
         let junk = json!({"connection": "pg", "table": "t", "rollback": 7});
         assert!(PgConfig::from_json(&junk).is_err());
     }
+
+    #[test]
+    fn config_requires_connection_and_table() {
+        let e = PgConfig::from_json(&json!({"table": "t"})).err().unwrap();
+        assert!(e.contains("config.connection required"), "got {e}");
+        let e = PgConfig::from_json(&json!({"connection": "pg"})).err().unwrap();
+        assert!(e.contains("config.table required"), "got {e}");
+        // Non-string values are as good as missing.
+        assert!(PgConfig::from_json(&json!({"connection": 5, "table": "t"})).is_err());
+        assert!(PgConfig::from_json(&json!({"connection": "pg", "table": ["t"]})).is_err());
+    }
+
+    #[test]
+    fn upsert_mode_requires_a_unique_key() {
+        let e = PgConfig::from_json(&json!({"connection": "pg", "table": "t", "mode": "upsert"}))
+            .err()
+            .unwrap();
+        assert!(e.contains("mode upsert requires unique_key"), "got {e}");
+        // insert mode without a unique key is fine
+        let cfg =
+            PgConfig::from_json(&json!({"connection": "pg", "table": "t", "mode": "insert"})).unwrap();
+        assert!(!cfg.upsert);
+        // an unknown mode is not upsert (fails open to plain insert)
+        let cfg =
+            PgConfig::from_json(&json!({"connection": "pg", "table": "t", "mode": "wat"})).unwrap();
+        assert!(!cfg.upsert);
+    }
+
+    #[test]
+    fn rollback_column_overrides_must_be_strings() {
+        let bad_block = json!({"connection": "pg", "table": "t",
+                               "rollback": {"block_number_column": 5}});
+        let e = PgConfig::from_json(&bad_block).err().unwrap();
+        assert!(e.contains("block_number_column must be a string"), "got {e}");
+
+        let bad_chain = json!({"connection": "pg", "table": "t",
+                               "rollback": {"chain_id_column": 5}});
+        let e = PgConfig::from_json(&bad_chain).err().unwrap();
+        assert!(e.contains("chain_id_column must be a string or null"), "got {e}");
+
+        // rollback: false is explicit "off", same as absent
+        let off = PgConfig::from_json(&json!({"connection": "pg", "table": "t", "rollback": false}))
+            .unwrap();
+        assert_eq!(off.rollback_block_column, None);
+        assert_eq!(off.rollback_chain_column, None);
+
+        // an empty object takes both defaults
+        let defaults =
+            PgConfig::from_json(&json!({"connection": "pg", "table": "t", "rollback": {}})).unwrap();
+        assert_eq!(defaults.rollback_block_column.as_deref(), Some("block_number"));
+        assert_eq!(defaults.rollback_chain_column.as_deref(), Some("chain_id"));
+    }
+
+    #[test]
+    fn config_reads_create_table_and_column_map() {
+        let cfg = PgConfig::from_json(&json!({
+            "connection": "pg", "table": "t", "create_table": true,
+            "column_map": {"params.value": "amount", "params.junk": 7}
+        }))
+        .unwrap();
+        assert!(cfg.create_table);
+        // non-string map targets are ignored, not errors
+        assert_eq!(cfg.column_map.get("params.value").map(String::as_str), Some("amount"));
+        assert!(!cfg.column_map.contains_key("params.junk"));
+        // create_table defaults off
+        assert!(!PgConfig::from_json(&json!({"connection": "pg", "table": "t"})).unwrap().create_table);
+    }
+
+    #[test]
+    fn upsert_with_every_column_in_the_key_does_nothing() {
+        // Nothing left to SET -> `DO UPDATE SET` would be a syntax error.
+        let row = vec![
+            ("chain_id".to_string(), json!(1)),
+            ("block_number".to_string(), json!(19000042)),
+        ];
+        let uk = vec!["chain_id".to_string(), "block_number".to_string()];
+        let sql = upsert_stmt("t", &row, &uk, true);
+        assert!(sql.ends_with("ON CONFLICT (\"chain_id\", \"block_number\") DO NOTHING"), "got {sql}");
+    }
+
+    #[test]
+    fn upsert_flag_off_ignores_the_unique_key() {
+        let row = vec![("a".to_string(), json!(1))];
+        let sql = upsert_stmt("t", &row, &["a".to_string()], false);
+        assert!(!sql.contains("ON CONFLICT"), "got {sql}");
+    }
+
+    #[test]
+    fn resolve_columns_skips_nested_values_at_top_level() {
+        let rec = json!({
+            "scalar": 1, "text": "x", "flag": true, "nothing": null,
+            "params": {"a": 1}, "topics": ["0x1"]
+        });
+        let cols = resolve_columns(&rec, &BTreeMap::new());
+        let names: Vec<&str> = cols.iter().map(|(c, _)| c.as_str()).collect();
+        // sorted, scalars only — nested objects/arrays enter only via column_map
+        assert_eq!(names, vec!["flag", "nothing", "scalar", "text"]);
+    }
+
+    #[test]
+    fn column_map_overwrites_an_existing_column() {
+        // `value` exists at top level AND is mapped from a nested path: the
+        // mapped value must win, and the column must not be duplicated.
+        let rec = json!({ "value": "top-level", "params": { "value": "nested" } });
+        let cm = map(&[("params.value", "value")]);
+        let cols = resolve_columns(&rec, &cm);
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0], ("value".to_string(), json!("nested")));
+    }
+
+    #[test]
+    fn column_map_path_that_misses_adds_no_column() {
+        let cm = map(&[("params.absent", "gone"), ("no.such.path", "nope")]);
+        let cols = resolve_columns(&decoded(), &cm);
+        let names: Vec<&str> = cols.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(!names.contains(&"gone"));
+        assert!(!names.contains(&"nope"));
+    }
+
+    #[test]
+    fn resolve_columns_on_a_non_object_record() {
+        assert!(resolve_columns(&json!("just a string"), &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn col_type_maps_json_shapes_to_postgres_types() {
+        let cases = [
+            (json!(true), "boolean"),
+            (json!(42), "bigint"),
+            (json!(-42), "bigint"),
+            (json!(1.5), "double precision"),
+            (json!("5000000000000"), "numeric"),
+            (json!("-42"), "numeric"),
+            (json!("0xdead"), "text"),
+            (json!("hello"), "text"),
+            (json!(null), "jsonb"),
+            (json!({"a": 1}), "jsonb"),
+            (json!([1, 2]), "jsonb"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(col_type(&v), want, "col_type({v})");
+        }
+    }
+
+    #[test]
+    fn is_decimal_edges() {
+        assert!(is_decimal("0"));
+        assert!(is_decimal("-5"));
+        assert!(is_decimal("123456789012345678901234567890"));
+        assert!(!is_decimal(""), "empty string is not a number");
+        assert!(!is_decimal("-"), "a lone sign is not a number");
+        assert!(!is_decimal("12a"));
+        assert!(!is_decimal("1.5"), "decimals here means integers only");
+        assert!(!is_decimal(" 1"));
+    }
+
+    #[test]
+    fn placeholders_cast_only_decimal_strings() {
+        assert_eq!(placeholder(1, &json!("500")), "$1::numeric");
+        assert_eq!(placeholder(2, &json!(500)), "$2");
+        assert_eq!(placeholder(3, &json!("0xabc")), "$3");
+        assert_eq!(placeholder(4, &json!(null)), "$4");
+    }
+
+    #[test]
+    fn union_columns_over_no_rows_is_empty() {
+        assert!(union_columns(&[]).is_empty());
+        assert!(group_by_signature(vec![]).is_empty());
+    }
 }

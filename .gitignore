@@ -8,3 +8,12 @@
 *.cwasm
 /dist
 pipeline.env
+
+# Coverage: instrumented binaries drop these wherever they are run from
+# (LLVM_PROFILE_FILE only redirects them when it is exported).
+*.profraw
+*.profdata
+
+# Build output of the out-of-tree example module. Rebuild with
+# `just build-example-module` (scripts/e2e/08 needs it).
+/examples/modules/enrich.wasm

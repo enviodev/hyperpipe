@@ -130,4 +130,60 @@ mod tests {
         assert!(missing.is_empty());
         assert_eq!(v["u"], "1-2");
     }
+
+    #[test]
+    fn strings_without_refs_are_left_alone() {
+        let mut v = serde_json::json!({ "plain": "no refs", "n": 5, "b": true, "nil": null });
+        let missing = resolve_in_place(&mut v, &src(&[]));
+        assert!(missing.is_empty());
+        assert_eq!(v["plain"], "no refs");
+        assert_eq!(v["n"], 5);
+        assert!(replace_refs("nothing to do", &src(&[]), &mut BTreeSet::new()).is_none());
+    }
+
+    #[test]
+    fn an_unterminated_ref_stays_literal() {
+        // `${secret:PG` (no closing brace) is not a ref — it is passed through
+        // untouched rather than swallowing the rest of the string.
+        let mut v = serde_json::json!({ "dsn": "postgres://${secret:PG@h/db" });
+        let missing = resolve_in_place(&mut v, &src(&[("PG", "user:pw")]));
+        assert!(missing.is_empty(), "an unterminated ref is not a missing secret");
+        assert_eq!(v["dsn"], "postgres://${secret:PG@h/db");
+
+        // A well-formed ref before a broken one still resolves.
+        let mut v = serde_json::json!({ "u": "${secret:A}/${secret:B" });
+        let missing = resolve_in_place(&mut v, &src(&[("A", "1")]));
+        assert!(missing.is_empty());
+        assert_eq!(v["u"], "1/${secret:B");
+    }
+
+    #[test]
+    fn a_missing_secret_leaves_the_placeholder_in_place() {
+        // The document must stay well-formed for the error path to render it.
+        let mut v = serde_json::json!({ "dsn": "postgres://${secret:PG}@h/db" });
+        let missing = resolve_in_place(&mut v, &src(&[]));
+        assert_eq!(missing.into_iter().collect::<Vec<_>>(), vec!["PG"]);
+        assert_eq!(v["dsn"], "postgres://${secret:PG}@h/db");
+    }
+
+    #[test]
+    fn refs_resolve_at_every_depth() {
+        let mut v = serde_json::json!({
+            "sinks": [{ "config": { "url": "${secret:HOOK}" } }],
+            "nested": { "deep": { "deeper": ["${secret:HOOK}"] } }
+        });
+        let missing = resolve_in_place(&mut v, &src(&[("HOOK", "https://h/x")]));
+        assert!(missing.is_empty());
+        assert_eq!(v["sinks"][0]["config"]["url"], "https://h/x");
+        assert_eq!(v["nested"]["deep"]["deeper"][0], "https://h/x");
+    }
+
+    #[test]
+    fn env_secrets_reads_the_prefixed_var() {
+        // The prefix is the contract users configure against.
+        std::env::set_var("HYPERPIPE_SECRET_HP_TEST_ONLY", "resolved");
+        assert_eq!(EnvSecrets.get("HP_TEST_ONLY").as_deref(), Some("resolved"));
+        assert_eq!(EnvSecrets.get("HP_TEST_DEFINITELY_UNSET"), None);
+        std::env::remove_var("HYPERPIPE_SECRET_HP_TEST_ONLY");
+    }
 }

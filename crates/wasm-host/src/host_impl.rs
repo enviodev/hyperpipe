@@ -410,4 +410,497 @@ mod tests {
         // still no suffix tricks with different case
         assert!(!host_allowed_by(&allow(&["slack.com"]), "https://EVIL-SLACK.COM/x"));
     }
+
+    // ---- host imports ------------------------------------------------------
+    //
+    // These drive `HostState` directly — no wasm needed. The import bodies use
+    // `Handle::block_on`, so every test owns a tokio runtime and calls from the
+    // test thread (outside it), exactly as `spawn_blocking` does in the engine.
+
+    use hp_testutil::{MockServer, Reply};
+    use serde_json::json;
+    use sqlx::Row;
+
+    struct Harness {
+        _rt: tokio::runtime::Runtime,
+        services: Arc<HostServices>,
+        kv: Arc<MemKv>,
+    }
+
+    fn harness() -> Harness {
+        harness_with(HashMap::new(), HashMap::new())
+    }
+
+    fn harness_with(
+        sql: HashMap<String, sqlx::Pool<sqlx::Postgres>>,
+        blob: HashMap<String, BlobConn>,
+    ) -> Harness {
+        let rt = tokio::runtime::Runtime::new().expect("tokio");
+        let kv = Arc::new(MemKv::default());
+        let services = Arc::new(HostServices {
+            http: reqwest::Client::builder().build().unwrap(),
+            sql,
+            blob,
+            handle: rt.handle().clone(),
+            kv: kv.clone(),
+            metrics: Arc::new(Metrics::default()),
+        });
+        Harness { _rt: rt, services, kv }
+    }
+
+    impl Harness {
+        fn state(&self, module: &str, http_allow: &[&str], conns: &[&str]) -> HostState {
+            HostState::new(
+                module.to_string(),
+                http_allow.iter().map(|s| s.to_string()).collect(),
+                conns.iter().map(|s| s.to_string()).collect(),
+                self.services.clone(),
+                wasmtime::StoreLimitsBuilder::new().build(),
+            )
+        }
+    }
+
+    fn req(method: &str, url: &str) -> HttpRequest {
+        HttpRequest {
+            method: method.to_string(),
+            url: url.to_string(),
+            headers: vec![],
+            body: None,
+        }
+    }
+
+    #[test]
+    fn http_to_a_denied_host_never_touches_the_network() {
+        let h = harness();
+        let srv = h._rt.block_on(MockServer::start(|_p, _b, _i| Reply::json(json!({}))));
+        // The module is granted a *different* host.
+        let mut st = h.state("webhook", &["api.example.com"], &[]);
+
+        let out = st.http(req("POST", &format!("{}/hook", srv.url))).unwrap();
+        let e = out.err().expect("must be denied");
+        assert!(e.contains("http denied"), "got {e}");
+        assert!(e.contains("api.example.com"), "the error should show the allowlist: {e}");
+        assert_eq!(srv.call_count(), 0, "a denied call must not reach the server");
+    }
+
+    #[test]
+    fn http_with_an_empty_allowlist_denies_everything() {
+        let h = harness();
+        let mut st = h.state("webhook", &[], &[]);
+        let out = st.http(req("GET", "https://example.com/")).unwrap();
+        assert!(out.err().unwrap().contains("http denied"));
+    }
+
+    #[test]
+    fn http_to_an_allowed_host_round_trips() {
+        let h = harness();
+        let srv = h._rt.block_on(MockServer::start(|path, body, _i| {
+            assert_eq!(path, "/hook");
+            assert_eq!(body["hello"], "world");
+            Reply::json(json!({ "ok": true })).with_header("x-test", "yes")
+        }));
+        let mut st = h.state("webhook", &["127.0.0.1"], &[]);
+
+        let mut r = req("POST", &format!("{}/hook", srv.url));
+        r.headers = vec![("content-type".into(), "application/json".into())];
+        r.body = Some(br#"{"hello":"world"}"#.to_vec());
+
+        let resp = st.http(r).unwrap().expect("allowed");
+        assert_eq!(resp.status, 200);
+        assert_eq!(String::from_utf8(resp.body).unwrap(), r#"{"ok":true}"#);
+        assert!(resp.headers.iter().any(|(k, v)| k == "x-test" && v == "yes"));
+        assert_eq!(srv.requests()[0].path, "/hook");
+    }
+
+    #[test]
+    fn http_rejects_a_declared_body_over_the_limit() {
+        // Guard the host's memory before reading a byte: an allowlisted but
+        // misbehaving endpoint must not be able to OOM us.
+        let h = harness();
+        let srv = h._rt.block_on(MockServer::start(|_p, _b, _i| {
+            Reply::declaring_length(HTTP_BODY_LIMIT as u64 + 1)
+        }));
+        let mut st = h.state("m", &["127.0.0.1"], &[]);
+        let e = st.http(req("GET", &srv.url)).unwrap().err().expect("too big");
+        assert!(e.contains("exceeds"), "got {e}");
+        assert!(e.contains(&HTTP_BODY_LIMIT.to_string()), "got {e}");
+    }
+
+    #[test]
+    fn http_rejects_an_undeclared_body_over_the_limit() {
+        // No content-length: the cap has to hold while streaming chunks.
+        let h = harness();
+        let srv = h._rt.block_on(MockServer::start(|_p, _b, _i| {
+            Reply::until_eof("x".repeat(HTTP_BODY_LIMIT + 1024))
+        }));
+        let mut st = h.state("m", &["127.0.0.1"], &[]);
+        let e = st.http(req("GET", &srv.url)).unwrap().err().expect("too big");
+        assert!(e.contains("byte limit"), "got {e}");
+    }
+
+    #[test]
+    fn http_rejects_a_bad_method() {
+        let h = harness();
+        let srv = h._rt.block_on(MockServer::start(|_p, _b, _i| Reply::json(json!({}))));
+        let mut st = h.state("m", &["127.0.0.1"], &[]);
+        let e = st.http(req("GET SPACE", &srv.url)).unwrap().err().expect("bad method");
+        assert!(e.contains("bad method"), "got {e}");
+        assert_eq!(srv.call_count(), 0);
+    }
+
+    #[test]
+    fn http_surfaces_transport_errors() {
+        let h = harness();
+        // Nothing is listening on this port.
+        let mut st = h.state("m", &["127.0.0.1"], &[]);
+        let e = st
+            .http(req("GET", "http://127.0.0.1:1/x"))
+            .unwrap()
+            .err()
+            .expect("connection refused");
+        assert!(e.contains("request:"), "got {e}");
+    }
+
+    // ---- sql ---------------------------------------------------------------
+
+    #[test]
+    fn sql_to_an_ungranted_connection_is_denied() {
+        let h = harness();
+        let mut st = h.state("pg_sink", &[], &["other_db"]);
+        let e = st
+            .sql_exec("main_db".into(), "SELECT 1".into(), vec![])
+            .unwrap()
+            .err()
+            .expect("denied");
+        assert!(e.contains("connection `main_db` not granted to module `pg_sink`"), "got {e}");
+    }
+
+    #[test]
+    fn sql_to_a_granted_connection_with_no_pool_says_so() {
+        // Granted in config, but the engine opened no pool for it.
+        let h = harness();
+        let mut st = h.state("pg_sink", &[], &["main_db"]);
+        let e = st
+            .sql_batch("main_db".into(), vec![("SELECT 1".into(), vec![])])
+            .unwrap()
+            .err()
+            .expect("no pool");
+        assert!(e.contains("has no open pool"), "got {e}");
+    }
+
+    #[test]
+    fn kafka_is_not_wired_yet() {
+        let h = harness();
+        let mut st = h.state("m", &[], &["k"]);
+        let e = st
+            .kafka_produce("k".into(), "topic".into(), None, b"x".to_vec())
+            .unwrap()
+            .err()
+            .unwrap();
+        assert!(e.contains("kafka sink not wired"), "got {e}");
+    }
+
+    // ---- blob --------------------------------------------------------------
+
+    fn local_blob(dir: &std::path::Path, prefix: &str) -> BlobConn {
+        std::fs::create_dir_all(dir).unwrap();
+        BlobConn {
+            store: Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir).unwrap()),
+            prefix: prefix.to_string(),
+        }
+    }
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("hp-host-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn blob_put_to_an_ungranted_connection_is_denied() {
+        let dir = tmpdir("blob-denied");
+        let blob = HashMap::from([("lake".to_string(), local_blob(&dir, ""))]);
+        let h = harness_with(HashMap::new(), blob);
+        let mut st = h.state("s3_sink", &[], &[]); // no grants at all
+        let e = st
+            .blob_put("lake".into(), "k.parquet".into(), b"x".to_vec())
+            .unwrap()
+            .err()
+            .expect("denied");
+        assert!(e.contains("connection `lake` not granted to module `s3_sink`"), "got {e}");
+        assert!(!dir.join("k.parquet").exists(), "nothing may be written");
+    }
+
+    #[test]
+    fn blob_put_to_a_granted_connection_with_no_store_says_so() {
+        let h = harness();
+        let mut st = h.state("s3_sink", &[], &["lake"]);
+        let e = st
+            .blob_put("lake".into(), "k".into(), b"x".to_vec())
+            .unwrap()
+            .err()
+            .expect("no store");
+        assert!(e.contains("has no open object store"), "got {e}");
+    }
+
+    #[test]
+    fn blob_put_writes_under_the_connection_prefix() {
+        let dir = tmpdir("blob-prefix");
+        let blob = HashMap::from([("lake".to_string(), local_blob(&dir, "hyperpipe/v1/"))]);
+        let h = harness_with(HashMap::new(), blob);
+        let mut st = h.state("s3_sink", &[], &["lake"]);
+
+        st.blob_put("lake".into(), "1/100-200-5.parquet".into(), b"PAR1".to_vec())
+            .unwrap()
+            .expect("granted");
+
+        // The module's key is relative; the connection prefix is the host's.
+        let path = dir.join("hyperpipe/v1/1/100-200-5.parquet");
+        assert!(path.exists(), "expected {path:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"PAR1");
+    }
+
+    #[test]
+    fn blob_put_with_no_prefix_uses_the_key_verbatim() {
+        let dir = tmpdir("blob-noprefix");
+        let blob = HashMap::from([("lake".to_string(), local_blob(&dir, ""))]);
+        let h = harness_with(HashMap::new(), blob);
+        let mut st = h.state("s3_sink", &[], &["lake"]);
+        st.blob_put("lake".into(), "8453/1-2-1.ndjson".into(), b"{}".to_vec())
+            .unwrap()
+            .unwrap();
+        assert!(dir.join("8453/1-2-1.ndjson").exists());
+    }
+
+    // ---- kv / metrics / logging -------------------------------------------
+
+    #[test]
+    fn kv_is_namespaced_per_module() {
+        // Two modules using the same key must not see each other's value.
+        let h = harness();
+        let mut a = h.state("dedupe", &[], &[]);
+        let mut b = h.state("enrich", &[], &[]);
+
+        a.kv_set("window".into(), b"from-a".to_vec()).unwrap();
+        b.kv_set("window".into(), b"from-b".to_vec()).unwrap();
+
+        assert_eq!(a.kv_get("window".into()).unwrap(), Some(b"from-a".to_vec()));
+        assert_eq!(b.kv_get("window".into()).unwrap(), Some(b"from-b".to_vec()));
+        assert_eq!(a.kv_get("never-set".into()).unwrap(), None);
+        // and the namespacing is visible in the backing store
+        assert_eq!(h.kv.get("dedupe", "window"), Some(b"from-a".to_vec()));
+    }
+
+    #[test]
+    fn mem_kv_roundtrips() {
+        let kv = MemKv::default();
+        assert_eq!(kv.get("m", "k"), None);
+        kv.set("m", "k", b"v".to_vec());
+        assert_eq!(kv.get("m", "k"), Some(b"v".to_vec()));
+        kv.set("m", "k", b"v2".to_vec());
+        assert_eq!(kv.get("m", "k"), Some(b"v2".to_vec()));
+        assert_eq!(kv.get("other", "k"), None);
+    }
+
+    #[test]
+    fn metrics_are_prefixed_with_the_module_name() {
+        let h = harness();
+        let mut a = h.state("whale_filter", &[], &[]);
+        let mut b = h.state("decode", &[], &[]);
+        a.metric_add("dropped".into(), 3).unwrap();
+        a.metric_add("dropped".into(), 2).unwrap();
+        b.metric_add("dropped".into(), 7).unwrap();
+
+        let snap = h.services.metrics.snapshot();
+        assert_eq!(snap.get("whale_filter.dropped"), Some(&5), "same-named counters must not merge");
+        assert_eq!(snap.get("decode.dropped"), Some(&7));
+        assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn metrics_snapshot_of_a_fresh_registry_is_empty() {
+        assert!(Metrics::default().snapshot().is_empty());
+    }
+
+    #[test]
+    fn log_accepts_every_level() {
+        let h = harness();
+        let mut st = h.state("m", &[], &[]);
+        for lvl in [LogLevel::Trace, LogLevel::Debug, LogLevel::Info, LogLevel::Warn, LogLevel::Error] {
+            st.log(lvl, "message".into()).unwrap();
+        }
+    }
+
+    // ---- postgres-backed (soft-skips without HP_TEST_PG_DSN) ---------------
+
+    /// The DSN of a throwaway postgres, e.g.
+    /// `HP_TEST_PG_DSN=postgres://postgres:hp@127.0.0.1:5435/hp`.
+    fn pg_dsn() -> Option<String> {
+        std::env::var("HP_TEST_PG_DSN").ok()
+    }
+
+    fn pg_harness(table: &str) -> Option<Harness> {
+        let dsn = match pg_dsn() {
+            Some(d) => d,
+            None => {
+                eprintln!("SKIP: set HP_TEST_PG_DSN to run the postgres host-import tests");
+                return None;
+            }
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pool = rt
+            .block_on(sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&dsn))
+            .expect("HP_TEST_PG_DSN is set but unreachable");
+        rt.block_on(async {
+            sqlx::query(&format!("DROP TABLE IF EXISTS {table}")).execute(&pool).await.unwrap();
+            sqlx::query(&format!("CREATE TABLE {table} (id bigint primary key, v text)"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        });
+        let kv = Arc::new(MemKv::default());
+        let services = Arc::new(HostServices {
+            http: reqwest::Client::builder().build().unwrap(),
+            sql: HashMap::from([("main".to_string(), pool)]),
+            blob: HashMap::new(),
+            handle: rt.handle().clone(),
+            kv: kv.clone(),
+            metrics: Arc::new(Metrics::default()),
+        });
+        Some(Harness { _rt: rt, services, kv })
+    }
+
+    fn pg_rows(h: &Harness, table: &str) -> Vec<(i64, Option<String>)> {
+        let pool = h.services.sql.get("main").unwrap().clone();
+        h.services.handle.block_on(async move {
+            sqlx::query(&format!("SELECT id, v FROM {table} ORDER BY id"))
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.get::<i64, _>("id"), r.get::<Option<String>, _>("v")))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn sql_batch_commits_every_statement_in_one_transaction() {
+        let Some(h) = pg_harness("hp_test_batch") else { return };
+        let mut st = h.state("pg_sink", &[], &["main"]);
+        let stmts = vec![
+            (
+                "INSERT INTO hp_test_batch (id, v) VALUES ($1, $2)".to_string(),
+                serde_json::to_vec(&json!([1, "a"])).unwrap(),
+            ),
+            (
+                "INSERT INTO hp_test_batch (id, v) VALUES ($1, $2)".to_string(),
+                serde_json::to_vec(&json!([2, "b"])).unwrap(),
+            ),
+        ];
+        let affected = st.sql_batch("main".into(), stmts).unwrap().expect("committed");
+        assert_eq!(affected, 2, "affected rows are summed across statements");
+        assert_eq!(pg_rows(&h, "hp_test_batch"), vec![(1, Some("a".into())), (2, Some("b".into()))]);
+    }
+
+    #[test]
+    fn a_failing_statement_rolls_the_whole_batch_back() {
+        // Atomicity is what lets the engine retry a whole batch safely.
+        let Some(h) = pg_harness("hp_test_rollback") else { return };
+        let mut st = h.state("pg_sink", &[], &["main"]);
+        let stmts = vec![
+            (
+                "INSERT INTO hp_test_rollback (id, v) VALUES ($1, $2)".to_string(),
+                serde_json::to_vec(&json!([1, "a"])).unwrap(),
+            ),
+            ("INSERT INTO hp_test_rollback (id, v) VALUES (nope)".to_string(), vec![]),
+        ];
+        let e = st.sql_batch("main".into(), stmts).unwrap().err().expect("must fail");
+        assert!(e.contains("exec:"), "got {e}");
+        assert!(
+            pg_rows(&h, "hp_test_rollback").is_empty(),
+            "the first insert must not survive its batch"
+        );
+    }
+
+    #[test]
+    fn malformed_params_json_is_rejected() {
+        let Some(h) = pg_harness("hp_test_params") else { return };
+        let mut st = h.state("pg_sink", &[], &["main"]);
+        let e = st
+            .sql_exec(
+                "main".into(),
+                "INSERT INTO hp_test_params (id) VALUES ($1)".into(),
+                b"{not json".to_vec(),
+            )
+            .unwrap()
+            .err()
+            .expect("bad params");
+        assert!(e.contains("params json"), "got {e}");
+    }
+
+    #[test]
+    fn bind_json_maps_every_scalar_shape_onto_postgres() {
+        let Some(h) = pg_harness("hp_test_bind") else { return };
+        let pool = h.services.sql.get("main").unwrap().clone();
+        h.services.handle.block_on(async {
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS hp_test_bind_all (
+                    nul text, b boolean, i bigint, f double precision,
+                    big numeric, s text, arr text)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("DELETE FROM hp_test_bind_all").execute(&pool).await.unwrap();
+        });
+
+        let mut st = h.state("pg_sink", &[], &["main"]);
+        // A uint256 arrives as a decimal string (§3.1) and must land in `numeric`
+        // intact; an array becomes JSON text.
+        let params = json!([
+            null, true, -42, 1.5,
+            "123456789012345678901234567890",
+            "hello",
+            ["a", "b"]
+        ]);
+        st.sql_exec(
+            "main".into(),
+            "INSERT INTO hp_test_bind_all (nul, b, i, f, big, s, arr)
+             VALUES ($1, $2, $3, $4, $5::numeric, $6, $7)"
+                .into(),
+            serde_json::to_vec(&params).unwrap(),
+        )
+        .unwrap()
+        .expect("bound");
+
+        let row = h.services.handle.block_on(async {
+            sqlx::query("SELECT nul, b, i, f, big::text as big, s, arr FROM hp_test_bind_all")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        });
+        assert_eq!(row.get::<Option<String>, _>("nul"), None);
+        assert_eq!(row.get::<bool, _>("b"), true);
+        assert_eq!(row.get::<i64, _>("i"), -42);
+        assert_eq!(row.get::<f64, _>("f"), 1.5);
+        assert_eq!(row.get::<String, _>("big"), "123456789012345678901234567890");
+        assert_eq!(row.get::<String, _>("s"), "hello");
+        assert_eq!(row.get::<String, _>("arr"), r#"["a","b"]"#);
+    }
+
+    #[test]
+    fn empty_params_bind_nothing() {
+        let Some(h) = pg_harness("hp_test_noparams") else { return };
+        let mut st = h.state("pg_sink", &[], &["main"]);
+        let n = st
+            .sql_exec(
+                "main".into(),
+                "INSERT INTO hp_test_noparams (id, v) VALUES (1, 'x')".into(),
+                vec![],
+            )
+            .unwrap()
+            .expect("ok");
+        assert_eq!(n, 1);
+    }
 }

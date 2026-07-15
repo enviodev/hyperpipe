@@ -580,3 +580,231 @@ impl HostServices {
         Arc::new(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hp_encoding::{BatchKind, BlockRange};
+    use serde_json::json;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hp-blob-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn a_local_path_connection_becomes_a_filesystem_store() {
+        // The dev/test escape hatch: no MinIO, no credentials, just a directory.
+        let dir = tmpdir("local");
+        let conn = build_blob(&BlobConnCfg {
+            local_path: Some(dir.to_string_lossy().into_owned()),
+            prefix: Some("lake/".into()),
+            ..Default::default()
+        })
+        .expect("local store");
+        assert_eq!(conn.prefix, "lake/");
+        assert!(dir.exists(), "build_blob creates the directory");
+    }
+
+    #[test]
+    fn a_connection_with_neither_bucket_nor_local_path_is_rejected() {
+        let e = build_blob(&BlobConnCfg::default()).err().unwrap();
+        assert!(
+            format!("{e:#}").contains("needs `bucket` or `local_path`"),
+            "got {e:#}"
+        );
+    }
+
+    #[test]
+    fn an_s3_connection_builds_from_bucket_region_and_endpoint() {
+        // A custom endpoint (MinIO/localstack) implies allow_http.
+        let conn = build_blob(&BlobConnCfg {
+            bucket: Some("my-bucket".into()),
+            region: Some("us-east-1".into()),
+            endpoint: Some("http://127.0.0.1:9000".into()),
+            prefix: None,
+            local_path: None,
+        });
+        assert!(conn.is_ok(), "building must not require a live endpoint: {:?}", conn.err());
+        assert_eq!(conn.unwrap().prefix, "", "an absent prefix is empty, not None");
+    }
+
+    #[test]
+    fn local_path_wins_over_a_bucket() {
+        let dir = tmpdir("local-wins");
+        let conn = build_blob(&BlobConnCfg {
+            bucket: Some("ignored".into()),
+            local_path: Some(dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        assert!(conn.is_ok(), "local_path short-circuits the S3 builder");
+    }
+
+    // ---- wire codec --------------------------------------------------------
+
+    fn batch() -> Batch {
+        Batch::new(
+            "eth",
+            1,
+            BlockRange(100, 200),
+            0,
+            BatchKind::Log,
+            vec![json!({ "value": "5000000000000" })],
+        )
+    }
+
+    #[test]
+    fn wire_roundtrip_preserves_the_envelope() {
+        let b = batch();
+        let wire = to_wire(&b).unwrap();
+        assert!(matches!(wire.encoding, types_iface::Encoding::Json));
+        let back = from_wire(&wire).unwrap();
+        assert_eq!(back.batch_id, b.batch_id);
+        assert_eq!(back.block_range, b.block_range);
+        assert_eq!(back.records[0]["value"], "5000000000000");
+    }
+
+    #[test]
+    fn from_wire_reports_unwired_encodings() {
+        // A guest that tags its output cbor gets a clear error, not a panic.
+        let wire = types_iface::Batch {
+            encoding: types_iface::Encoding::Cbor,
+            data: to_wire(&batch()).unwrap().data,
+        };
+        let e = from_wire(&wire).err().expect("cbor is not wired");
+        assert!(e.contains("unsupported encoding"), "got {e}");
+
+        let wire = types_iface::Batch {
+            encoding: types_iface::Encoding::ArrowIpc,
+            data: vec![],
+        };
+        assert!(from_wire(&wire).is_err());
+    }
+
+    #[test]
+    fn from_wire_reports_malformed_payloads() {
+        let wire = types_iface::Batch {
+            encoding: types_iface::Encoding::Json,
+            data: b"{ not json".to_vec(),
+        };
+        assert!(from_wire(&wire).err().unwrap().contains("json"));
+    }
+
+    // ---- misc --------------------------------------------------------------
+
+    #[test]
+    fn sha256_hex_is_the_component_cache_key() {
+        // Same bytes -> same key (cache hit); one bit different -> new entry.
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_ne!(sha256_hex(b"abc"), sha256_hex(b"abd"));
+        assert_eq!(sha256_hex(b"").len(), 64);
+    }
+
+    #[test]
+    fn cache_dir_prefers_xdg_then_home() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let (xdg, home) = (std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"));
+
+        std::env::set_var("XDG_CACHE_HOME", "/xdg");
+        std::env::set_var("HOME", "/home/u");
+        assert_eq!(default_cache_dir(), PathBuf::from("/xdg/hyperpipe"));
+
+        std::env::remove_var("XDG_CACHE_HOME");
+        assert_eq!(default_cache_dir(), PathBuf::from("/home/u/.cache/hyperpipe"));
+
+        std::env::remove_var("HOME");
+        assert_eq!(default_cache_dir(), PathBuf::from(".cache/hyperpipe"));
+
+        if let Some(v) = xdg {
+            std::env::set_var("XDG_CACHE_HOME", v);
+        }
+        if let Some(v) = home {
+            std::env::set_var("HOME", v);
+        }
+    }
+
+    #[test]
+    fn default_runtime_config_matches_the_medium_profile() {
+        let c = RuntimeConfig::default();
+        assert_eq!(c.wasm_mem_bytes, 256 << 20);
+        assert_eq!(c.epoch_deadline_secs, 5);
+        assert_eq!(c.instances_per_stage, 2);
+    }
+
+    #[test]
+    fn bare_services_have_no_connections() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let s = build_services_bare(rt.handle().clone(), Arc::new(MemKv::default()));
+        assert!(s.sql.is_empty());
+        assert!(s.blob.is_empty());
+        assert!(s.metrics.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unusable_postgres_dsn_names_the_connection() {
+        // Fail at startup with the name the user wrote in their YAML, not with a
+        // bare sqlx error. (A malformed DSN rather than an unreachable host: the
+        // pool retries a refused connection for its full 30s acquire timeout,
+        // which is a slow test for the same `connect postgres` context line.)
+        let pg = HashMap::from([("main_db".to_string(), ("not-a-dsn".to_string(), 1u32))]);
+        let e = build_services_async(
+            tokio::runtime::Handle::current(),
+            pg,
+            HashMap::new(),
+            Arc::new(MemKv::default()),
+        )
+        .await
+        .err()
+        .expect("must fail");
+        assert!(format!("{e:#}").contains("connect postgres `main_db`"), "got {e:#}");
+    }
+
+    #[tokio::test]
+    async fn a_bad_blob_connection_names_the_connection() {
+        let blob = HashMap::from([("lake".to_string(), BlobConnCfg::default())]);
+        let e = build_services_async(
+            tokio::runtime::Handle::current(),
+            HashMap::new(),
+            blob,
+            Arc::new(MemKv::default()),
+        )
+        .await
+        .err()
+        .expect("must fail");
+        assert!(format!("{e:#}").contains("open object store `lake`"), "got {e:#}");
+    }
+
+    #[tokio::test]
+    async fn services_with_no_connections_build() {
+        let s = build_services_async(
+            tokio::runtime::Handle::current(),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(MemKv::default()),
+        )
+        .await
+        .unwrap();
+        assert!(s.sql.is_empty() && s.blob.is_empty());
+    }
+
+    #[test]
+    fn a_runtime_starts_and_stops_its_epoch_ticker() {
+        // Drop must join the ticker thread; leaking one per pipeline reload
+        // would pile up threads.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for _ in 0..3 {
+            let services = build_services_bare(rt.handle().clone(), Arc::new(MemKv::default()));
+            let mut cfg = RuntimeConfig::default();
+            cfg.cache_dir = std::env::temp_dir().join("hyperpipe-test-cache");
+            let r = Runtime::new(cfg, services).expect("runtime");
+            assert!(r.services().sql.is_empty());
+            drop(r);
+        }
+    }
+}

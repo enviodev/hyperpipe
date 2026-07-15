@@ -44,4 +44,26 @@ mod tests {
         assert_eq!(reg.lookup("base").unwrap().chain_id, 8453);
         assert!(reg.lookup("does-not-exist").is_none());
     }
+
+    #[test]
+    fn every_entry_has_a_usable_url() {
+        let reg = ChainRegistry::builtin();
+        let names: Vec<&String> = reg.names().collect();
+        assert!(!names.is_empty(), "the bundled registry must not be empty");
+        for name in names {
+            let e = reg.lookup(name).unwrap();
+            assert!(e.url.starts_with("http"), "{name}: url `{}` is not a URL", e.url);
+            assert!(e.chain_id > 0, "{name}: chain_id must be set");
+        }
+    }
+
+    #[test]
+    fn lookup_is_case_sensitive() {
+        // Names are keys, matched verbatim — `Ethereum` is not `ethereum`.
+        // Users who want a different spelling override with chain_id + url.
+        let reg = ChainRegistry::builtin();
+        assert!(reg.lookup("Ethereum").is_none());
+        assert!(reg.lookup(" ethereum").is_none());
+        assert!(reg.lookup("ethereum").is_some());
+    }
 }

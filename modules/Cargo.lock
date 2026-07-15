@@ -1465,6 +1465,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-chaos"
+version = "0.1.0"
+dependencies = [
+ "hyperpipe-sdk",
+ "serde_json",
+ "wit-bindgen 0.41.0",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

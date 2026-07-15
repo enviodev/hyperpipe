@@ -257,4 +257,132 @@ mod tests {
         assert!(f.passes(&json!({ "v": "0009" })));
         assert!(!f.passes(&json!({ "v": "10" })));
     }
+
+    #[test]
+    fn config_errors() {
+        // unknown op
+        let e = Filter::from_config(&json!({ "all": [{ "field": "a", "op": "matches", "value": 1 }] }))
+            .err()
+            .unwrap();
+        assert!(e.contains("unknown op `matches`"), "got {e}");
+
+        // predicate missing field / op
+        let e = Filter::from_config(&json!({ "all": [{ "op": "eq", "value": 1 }] })).err().unwrap();
+        assert!(e.contains("missing `field`"), "got {e}");
+        let e = Filter::from_config(&json!({ "all": [{ "field": "a", "value": 1 }] })).err().unwrap();
+        assert!(e.contains("missing `op`"), "got {e}");
+
+        // all/any must be arrays
+        let e = Filter::from_config(&json!({ "all": { "field": "a" } })).err().unwrap();
+        assert!(e.contains("must be arrays"), "got {e}");
+        assert!(Filter::from_config(&json!({ "any": "nope" })).is_err());
+
+        // no predicates at all — an accept-everything filter is a config mistake
+        let e = Filter::from_config(&json!({})).err().unwrap();
+        assert!(e.contains("must have `all` and/or `any`"), "got {e}");
+        assert!(Filter::from_config(&json!({ "all": [], "any": [] })).is_err());
+    }
+
+    #[test]
+    fn any_alone_is_a_valid_config() {
+        let f = Filter::from_config(&json!({ "any": [{ "field": "e", "op": "eq", "value": "T" }] }))
+            .unwrap();
+        assert!(f.passes(&json!({ "e": "T" })));
+        assert!(!f.passes(&json!({ "e": "X" })));
+    }
+
+    #[test]
+    fn ne_is_the_inverse_of_eq() {
+        let f = Filter::from_config(&json!({ "all": [{ "field": "e", "op": "ne", "value": "T" }] }))
+            .unwrap();
+        assert!(!f.passes(&json!({ "e": "T" })));
+        assert!(f.passes(&json!({ "e": "X" })));
+        // A missing field is not equal to anything, so `ne` passes it.
+        assert!(f.passes(&json!({})));
+    }
+
+    #[test]
+    fn every_comparison_op() {
+        let mk = |op: &str, v: &str| {
+            Filter::from_config(&json!({ "all": [{ "field": "v", "op": op, "value": v }] })).unwrap()
+        };
+        // lt
+        assert!(mk("lt", "10").passes(&json!({ "v": "9" })));
+        assert!(!mk("lt", "10").passes(&json!({ "v": "10" })));
+        // lte
+        assert!(mk("lte", "10").passes(&json!({ "v": "10" })));
+        assert!(!mk("lte", "10").passes(&json!({ "v": "11" })));
+        // gt
+        assert!(mk("gt", "10").passes(&json!({ "v": "11" })));
+        assert!(!mk("gt", "10").passes(&json!({ "v": "10" })));
+        // gte
+        assert!(mk("gte", "10").passes(&json!({ "v": "10" })));
+        assert!(!mk("gte", "10").passes(&json!({ "v": "9" })));
+    }
+
+    #[test]
+    fn in_needs_an_array_and_coerces_numeric_strings() {
+        // non-array `value` -> nothing can be "in" it
+        let f = Filter::from_config(&json!({ "all": [{ "field": "e", "op": "in", "value": "T" }] }))
+            .unwrap();
+        assert!(!f.passes(&json!({ "e": "T" })));
+
+        // "5" (string) and 5 (number) are the same value
+        let f = Filter::from_config(&json!({ "all": [{ "field": "v", "op": "in", "value": [5, 7] }] }))
+            .unwrap();
+        assert!(f.passes(&json!({ "v": "5" })));
+        assert!(f.passes(&json!({ "v": 7 })));
+        assert!(!f.passes(&json!({ "v": "6" })));
+    }
+
+    #[test]
+    fn comparisons_fail_closed_on_non_numeric_operands() {
+        // non-numeric lhs
+        let f = Filter::from_config(&json!({ "all": [{ "field": "v", "op": "gt", "value": "10" }] }))
+            .unwrap();
+        assert!(!f.passes(&json!({ "v": "abc" })));
+        assert!(!f.passes(&json!({ "v": true })));
+        assert!(!f.passes(&json!({ "v": null })));
+        assert!(!f.passes(&json!({})), "missing field must not pass");
+
+        // non-numeric rhs (config asks to compare against a word)
+        let f = Filter::from_config(&json!({ "all": [{ "field": "v", "op": "gt", "value": "abc" }] }))
+            .unwrap();
+        assert!(!f.passes(&json!({ "v": "10" })));
+    }
+
+    #[test]
+    fn equality_on_non_numeric_values() {
+        // plain string equality
+        let f = Filter::from_config(&json!({ "all": [{ "field": "e", "op": "eq", "value": "Transfer" }] }))
+            .unwrap();
+        assert!(f.passes(&json!({ "e": "Transfer" })));
+        assert!(!f.passes(&json!({ "e": "transfer" })), "eq is case-sensitive");
+
+        // bools compare structurally
+        let f = Filter::from_config(&json!({ "all": [{ "field": "b", "op": "eq", "value": true }] }))
+            .unwrap();
+        assert!(f.passes(&json!({ "b": true })));
+        assert!(!f.passes(&json!({ "b": false })));
+
+        // a predicate with no `value` compares against null
+        let f = Filter::from_config(&json!({ "all": [{ "field": "v", "op": "eq" }] })).unwrap();
+        assert!(f.passes(&json!({ "v": null })));
+        assert!(!f.passes(&json!({ "v": 1 })));
+        assert!(!f.passes(&json!({})), "absent != present-and-null");
+    }
+
+    #[test]
+    fn num_str_classifies_scalars() {
+        assert_eq!(num_str(&json!(42)), Some("42".to_string()));
+        assert_eq!(num_str(&json!(-42)), Some("-42".to_string()));
+        assert_eq!(num_str(&json!("42")), Some("42".to_string()));
+        assert_eq!(num_str(&json!("-42")), Some("-42".to_string()));
+        assert_eq!(num_str(&json!("")), None);
+        assert_eq!(num_str(&json!("-")), None);
+        assert_eq!(num_str(&json!("4.2")), None);
+        assert_eq!(num_str(&json!(true)), None);
+        assert_eq!(num_str(&json!(null)), None);
+        assert_eq!(num_str(&json!([1])), None);
+    }
 }

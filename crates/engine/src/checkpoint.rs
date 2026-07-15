@@ -406,4 +406,124 @@ mod tests {
             None
         );
     }
+
+    #[tokio::test]
+    async fn open_on_an_unwritable_path_errors() {
+        // A path whose parent cannot be created (a file stands where a dir must go).
+        let blocker = tmp_db("not-a-dir");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        let err = match CheckpointStore::open(
+            &format!("{blocker}/sub/ck.db"),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("opening under a file path must fail"),
+        };
+        assert!(
+            format!("{err:#}").contains("open checkpoint db"),
+            "expected the open context, got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_with_nothing_to_write_is_a_noop() {
+        let (store, _p) = open("empty-persist").await;
+        // No acks, no kv: must return Ok without opening a transaction.
+        store.persist_snapshot(Vec::new()).await.unwrap();
+        assert!(store.snapshot().is_empty());
+        let rows = sqlx::query("SELECT COUNT(*) as n FROM cursors")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.get::<i64, _>("n"), 0);
+    }
+
+    #[tokio::test]
+    async fn rewind_above_the_current_cursor_changes_nothing() {
+        let path = tmp_db("rewind-above");
+        {
+            let store = CheckpointStore::open(&path, tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            store.ack("src", "sink", 100);
+            store.persist_snapshot(store.snapshot()).await.unwrap();
+            // A "rewind" to a HIGHER block is not a rollback — it must not raise
+            // the watermark (that would skip blocks 100..500 on restart).
+            store.rewind("src", "sink", 500).await.unwrap();
+            assert_eq!(store.restore("src", &["sink".to_string()]), Some(100));
+        }
+        let store = CheckpointStore::open(&path, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.restore("src", &["sink".to_string()]),
+            Some(100),
+            "the SQLite row must not have been raised either"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_of_an_unknown_pair_seeds_the_cursor() {
+        let (store, _p) = open("rewind-unknown").await;
+        // No prior ack: the rewind seeds the entry rather than panicking.
+        store.rewind("src", "never-acked", 42).await.unwrap();
+        assert_eq!(store.restore("src", &["never-acked".to_string()]), Some(42));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kv_get_caches_reads_from_a_previous_instance() {
+        let path = tmp_db("kv-readthrough");
+        {
+            let store = CheckpointStore::open(&path, tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+            store.set("mod", "k", b"v1".to_vec());
+            store.persist_snapshot(store.snapshot()).await.unwrap();
+        }
+        let store = std::sync::Arc::new(
+            CheckpointStore::open(&path, tokio::runtime::Handle::current())
+                .await
+                .unwrap(),
+        );
+        // First get: nothing dirty, nothing cached -> reads through to SQLite.
+        let s2 = store.clone();
+        let first = tokio::task::spawn_blocking(move || s2.get("mod", "k")).await.unwrap();
+        assert_eq!(first, Some(b"v1".to_vec()));
+
+        // Delete the row out from under the store: a cached get must not notice.
+        sqlx::query("DELETE FROM module_kv WHERE module='mod' AND key='k'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let s3 = store.clone();
+        let second = tokio::task::spawn_blocking(move || s3.get("mod", "k")).await.unwrap();
+        assert_eq!(second, Some(b"v1".to_vec()), "second get must come from kv_cache");
+
+        // A miss is cached as a miss too (no repeated SQLite hit per lookup).
+        let s4 = store.clone();
+        assert_eq!(
+            tokio::task::spawn_blocking(move || s4.get("mod", "absent")).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn kv_namespaces_do_not_bleed_between_modules() {
+        let (store, _p) = open("kv-namespace").await;
+        store.set("a", "same-key", b"from-a".to_vec());
+        store.set("b", "same-key", b"from-b".to_vec());
+        assert_eq!(store.get("a", "same-key"), Some(b"from-a".to_vec()));
+        assert_eq!(store.get("b", "same-key"), Some(b"from-b".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn restore_tolerates_a_duplicated_sink_in_the_list() {
+        let (store, _p) = open("restore-dupes").await;
+        store.ack("src", "a", 500);
+        store.ack("src", "b", 120);
+        let sinks = vec!["a".to_string(), "b".to_string(), "a".to_string()];
+        assert_eq!(store.restore("src", &sinks), Some(120));
+    }
 }
