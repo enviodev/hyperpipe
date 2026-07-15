@@ -357,4 +357,294 @@ mod tests {
         let out = dec.decode_record(1, &rec).unwrap().unwrap();
         assert_eq!(out["event"], "Approval");
     }
+
+    // ---- config errors ----------------------------------------------------
+
+    #[test]
+    fn config_requires_an_abis_array() {
+        let e = Decoder::from_config(&json!({})).err().unwrap();
+        assert!(e.contains("config.abis must be an array"), "got {e}");
+        assert!(Decoder::from_config(&json!({ "abis": "erc20.json" })).is_err());
+    }
+
+    #[test]
+    fn unsubstituted_file_ref_is_an_error() {
+        // The engine inlines `file:` into `abi:` before init — modules have no
+        // filesystem, so a surviving `file` key means the wiring broke.
+        let cfg = json!({ "abis": [{ "file": "erc20.json", "events": ["Transfer"] }] });
+        let e = Decoder::from_config(&cfg).err().unwrap();
+        assert!(e.contains("abis[0]"), "got {e}");
+        assert!(e.contains("was not substituted"), "got {e}");
+
+        // `file` alongside a real `abi` is fine (the engine leaves `file` in place).
+        let both = json!({ "abis": [{ "file": "erc20.json", "abi": erc20_abi() }] });
+        assert!(Decoder::from_config(&both).is_ok());
+    }
+
+    #[test]
+    fn entry_without_abi_contents_is_an_error() {
+        let e = Decoder::from_config(&json!({ "abis": [{ "events": ["Transfer"] }] }))
+            .err()
+            .unwrap();
+        assert!(e.contains("abis[0]: missing `abi` contents"), "got {e}");
+    }
+
+    #[test]
+    fn invalid_abi_json_is_an_error() {
+        let e = Decoder::from_config(&json!({ "abis": [{ "abi": {"not": "an abi"} }] }))
+            .err()
+            .unwrap();
+        assert!(e.contains("invalid ABI json"), "got {e}");
+        // The index of the bad entry is reported.
+        let e = Decoder::from_config(&json!({
+            "abis": [{ "abi": erc20_abi() }, { "abi": 42 }]
+        }))
+        .err()
+        .unwrap();
+        assert!(e.contains("abis[1]"), "got {e}");
+    }
+
+    #[test]
+    fn selecting_no_events_is_an_error() {
+        // A typo'd event name silently decoding nothing would be worse than this.
+        let cfg = json!({ "abis": [{ "abi": erc20_abi(), "events": ["Trasnfer"] }] });
+        let e = Decoder::from_config(&cfg).err().unwrap();
+        assert!(e.contains("no events selected"), "got {e}");
+
+        // An ABI with functions but no events hits the same arm.
+        let fn_only = json!([{"type":"function","name":"balanceOf","inputs":[],"outputs":[],
+                              "stateMutability":"view"}]);
+        assert!(Decoder::from_config(&json!({ "abis": [{ "abi": fn_only }] })).is_err());
+    }
+
+    #[test]
+    fn on_undecodable_parsing() {
+        let mk = |v: Value| {
+            let mut cfg = json!({ "abis": [{ "abi": erc20_abi(), "events": ["Transfer"] }] });
+            cfg.as_object_mut().unwrap().insert("on_undecodable".into(), v);
+            Decoder::from_config(&cfg)
+        };
+        let e = mk(json!("explode")).err().unwrap();
+        assert!(e.contains("unknown value `explode`"), "got {e}");
+
+        // absent -> drop (the safe default: unknown logs vanish, nothing errors)
+        let cfg = json!({ "abis": [{ "abi": erc20_abi(), "events": ["Transfer"] }] });
+        let dec = Decoder::from_config(&cfg).unwrap();
+        assert!(dec.decode_record(1, &json!({ "topic0": APPROVAL_TOPIC0 })).unwrap().is_none());
+
+        // a non-string value is ignored, also falling back to drop
+        assert!(mk(json!(5)).is_ok());
+    }
+
+    // ---- record-level errors ----------------------------------------------
+
+    #[test]
+    fn malformed_topics_and_data_error_even_in_drop_mode() {
+        // These are parse failures, not "undecodable log" — drop mode must not
+        // swallow them, or a corrupt feed would look like an empty one.
+        let cfg = json!({ "abis": [{ "abi": erc20_abi(), "events": ["Transfer"] }], "on_undecodable": "drop" });
+        let dec = Decoder::from_config(&cfg).unwrap();
+
+        let e = dec.decode_record(1, &json!({ "topic0": "0xnothex" })).err().unwrap();
+        assert!(e.contains("bad topic0"), "got {e}");
+
+        let bad_topic1 = json!({
+            "topic0": TRANSFER_TOPIC0,
+            "topic1": "0xzz",
+            "topic2": addr_word("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "data": u256_data(1)
+        });
+        let e = dec.decode_record(1, &bad_topic1).err().unwrap();
+        assert!(e.contains("bad topic1"), "got {e}");
+
+        let bad_data = json!({
+            "topic0": TRANSFER_TOPIC0,
+            "topic1": addr_word("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "topic2": addr_word("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "data": "0xzz"
+        });
+        let e = dec.decode_record(1, &bad_data).err().unwrap();
+        assert!(e.contains("bad data hex"), "got {e}");
+    }
+
+    #[test]
+    fn a_log_with_no_topic0_is_undecodable() {
+        let cfg = json!({ "abis": [{ "abi": erc20_abi() }], "on_undecodable": "error" });
+        let dec = Decoder::from_config(&cfg).unwrap();
+        let e = dec.decode_record(1, &json!({ "data": "0x" })).err().unwrap();
+        assert!(e.contains("no topic0"), "got {e}");
+    }
+
+    #[test]
+    fn empty_string_topics_are_skipped() {
+        // HyperSync pads absent topics as "" — treating them as real topics
+        // would push a zero word into the indexed list and mis-decode.
+        let cfg = json!({ "abis": [{ "abi": erc20_abi(), "events": ["Transfer"] }] });
+        let dec = Decoder::from_config(&cfg).unwrap();
+        let rec = json!({
+            "topic0": TRANSFER_TOPIC0,
+            "topic1": addr_word("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "topic2": addr_word("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "topic3": "",
+            "data": u256_data(9)
+        });
+        let out = dec.decode_record(1, &rec).unwrap().unwrap();
+        assert_eq!(out["params"]["value"], "9");
+    }
+
+    #[test]
+    fn decode_failure_of_a_known_event_errors() {
+        // Right topic0, wrong body: the value word is missing entirely.
+        let cfg = json!({ "abis": [{ "abi": erc20_abi(), "events": ["Transfer"] }] });
+        let dec = Decoder::from_config(&cfg).unwrap();
+        let rec = json!({
+            "topic0": TRANSFER_TOPIC0,
+            "topic1": addr_word("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "topic2": addr_word("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "data": "0x"
+        });
+        let e = dec.decode_record(1, &rec).err().unwrap();
+        assert!(e.contains("decode Transfer"), "got {e}");
+    }
+
+    // ---- field coercion + output shape ------------------------------------
+
+    #[test]
+    fn numeric_fields_accept_every_hypersync_encoding() {
+        let cfg = json!({ "abis": [{ "abi": erc20_abi(), "events": ["Transfer"] }] });
+        let dec = Decoder::from_config(&cfg).unwrap();
+        let with = |bn: Value, li: Value, ts: Value| {
+            json!({
+                "topic0": TRANSFER_TOPIC0,
+                "topic1": addr_word("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                "topic2": addr_word("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                "data": u256_data(1),
+                "block_number": bn, "log_index": li, "block_timestamp": ts
+            })
+        };
+        // hex string
+        let out = dec.decode_record(1, &with(json!("0x2a"), json!("0x3"), json!("0x10"))).unwrap().unwrap();
+        assert_eq!(out["block_number"], 42);
+        assert_eq!(out["log_index"], 3);
+        assert_eq!(out["block_timestamp"], 16);
+        // decimal string
+        let out = dec.decode_record(1, &with(json!("42"), json!("3"), json!("16"))).unwrap().unwrap();
+        assert_eq!(out["block_number"], 42);
+        // plain number
+        let out = dec.decode_record(1, &with(json!(42), json!(3), json!(16))).unwrap().unwrap();
+        assert_eq!(out["block_number"], 42);
+        // unparseable / missing -> 0 for block_number+log_index, absent timestamp
+        let out = dec.decode_record(1, &with(json!("junk"), json!(null), json!("junk"))).unwrap().unwrap();
+        assert_eq!(out["block_number"], 0);
+        assert_eq!(out["log_index"], 0);
+        assert!(out.get("block_timestamp").is_none());
+    }
+
+    #[test]
+    fn optional_fields_are_omitted_when_absent() {
+        let cfg = json!({ "abis": [{ "abi": erc20_abi(), "events": ["Transfer"] }] });
+        let dec = Decoder::from_config(&cfg).unwrap();
+        let rec = json!({
+            "topic0": TRANSFER_TOPIC0,
+            "topic1": addr_word("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "topic2": addr_word("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "data": u256_data(1)
+        });
+        let out = dec.decode_record(7, &rec).unwrap().unwrap();
+        for absent in ["block_hash", "transaction_hash", "address", "block_timestamp"] {
+            assert!(out.get(absent).is_none(), "{absent} must be omitted, not null");
+        }
+        // required identity fields are always present
+        assert_eq!(out["chain_id"], 7);
+        assert_eq!(out["event"], "Transfer");
+    }
+
+    #[test]
+    fn block_metadata_is_copied_when_present() {
+        let cfg = json!({ "abis": [{ "abi": erc20_abi(), "events": ["Transfer"] }] });
+        let dec = Decoder::from_config(&cfg).unwrap();
+        let rec = json!({
+            "topic0": TRANSFER_TOPIC0,
+            "topic1": addr_word("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "topic2": addr_word("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "data": u256_data(1),
+            "block_hash": "0xbh", "transaction_hash": "0xtx", "address": "0xusdc"
+        });
+        let out = dec.decode_record(1, &rec).unwrap().unwrap();
+        assert_eq!(out["block_hash"], "0xbh");
+        assert_eq!(out["transaction_hash"], "0xtx");
+        assert_eq!(out["address"], "0xusdc");
+    }
+
+    // ---- dyn_to_json over every solidity value shape -----------------------
+
+    /// `event Multi(bool,bytes,string,bytes32,int256,uint256[])` — one event
+    /// carrying every `dyn_to_json` arm we can hit through a real decode.
+    fn multi_abi() -> Value {
+        json!([
+            {"anonymous":false,"type":"event","name":"Multi","inputs":[
+                {"indexed":false,"name":"flag","type":"bool"},
+                {"indexed":false,"name":"blob","type":"bytes"},
+                {"indexed":false,"name":"note","type":"string"},
+                {"indexed":false,"name":"id","type":"bytes32"},
+                {"indexed":false,"name":"signed","type":"int256"},
+                {"indexed":false,"name":"amounts","type":"uint256[]"}]}
+        ])
+    }
+
+    #[test]
+    fn dyn_to_json_renders_every_value_kind() {
+        use alloy_primitives::{I256, U256};
+
+        let abi: JsonAbi = serde_json::from_value(multi_abi()).unwrap();
+        let event = abi.events().next().unwrap().clone();
+        let topic0 = format!("{:?}", event.selector());
+
+        let body = DynSolValue::Tuple(vec![
+            DynSolValue::Bool(true),
+            DynSolValue::Bytes(vec![0xde, 0xad]),
+            DynSolValue::String("hello".into()),
+            DynSolValue::FixedBytes(B256::repeat_byte(0xab), 32),
+            DynSolValue::Int(I256::try_from(-42i64).unwrap(), 256),
+            DynSolValue::Array(vec![
+                DynSolValue::Uint(U256::from(1u64), 256),
+                // beyond 2^53: must survive as a decimal string, not a float
+                DynSolValue::Uint(U256::from(123456789012345678901234567890u128), 256),
+            ]),
+        ]);
+        let data = format!("0x{}", alloy_primitives::hex::encode(body.abi_encode_params()));
+
+        let dec = Decoder::from_config(&json!({ "abis": [{ "abi": multi_abi() }] })).unwrap();
+        let out = dec
+            .decode_record(1, &json!({ "topic0": topic0, "data": data }))
+            .unwrap()
+            .unwrap();
+        let p = &out["params"];
+        assert_eq!(p["flag"], json!(true), "Bool stays a JSON bool");
+        assert_eq!(p["blob"], "0xdead");
+        assert_eq!(p["note"], "hello");
+        assert_eq!(p["id"], format!("0x{}", "ab".repeat(32)));
+        assert_eq!(p["signed"], "-42", "negative int256 -> signed decimal string");
+        assert_eq!(p["amounts"], json!(["1", "123456789012345678901234567890"]));
+    }
+
+    #[test]
+    fn address_params_are_checksummed() {
+        let cfg = json!({ "abis": [{ "abi": erc20_abi(), "events": ["Transfer"] }] });
+        let dec = Decoder::from_config(&cfg).unwrap();
+        let rec = json!({
+            "topic0": TRANSFER_TOPIC0,
+            "topic1": addr_word("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+            "topic2": addr_word("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "data": u256_data(1)
+        });
+        let out = dec.decode_record(1, &rec).unwrap().unwrap();
+        assert_eq!(out["params"]["from"], "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    }
+
+    #[test]
+    fn addr_topic_widens_an_address_to_a_word() {
+        let a: Address = "0x00000000000000000000000000000000000000ff".parse().unwrap();
+        assert_eq!(addr_topic(a), B256::from(alloy_primitives::U256::from(0xffu64)));
+    }
 }

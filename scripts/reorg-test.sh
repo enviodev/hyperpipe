@@ -23,15 +23,19 @@ FORK=$((REORG_AT - REORG_DEPTH))   # first block on the new fork
 PG_CONTAINER="${PG_CONTAINER:-hp-pg}"
 PG_USER="${PG_USER:-postgres}"
 PG_DB="${PG_DB:-hp}"
-PG_DSN="${PG_DSN:-postgres://postgres:hp@127.0.0.1:5433/hp}"
+PG_DSN="${PG_DSN:-postgres://postgres:hp@127.0.0.1:5436/hp}"
 
 export HYPERPIPE_MODULE_DIR="$ROOT/modules/target/wasm32-wasip2/debug"
 export HYPERPIPE_SECRET_PG_DSN="$PG_DSN"
-export RUST_LOG=hyperpipe=info
+# The "reorg detected" warning comes from the source layer, so that target has
+# to be enabled for the grep below to show anything. An inherited RUST_LOG wins
+# (scripts/e2e/04 asserts on these lines).
+: "${RUST_LOG:=hyperpipe=info,hp_source_hypersync=info}"
+export RUST_LOG
 
 command -v docker >/dev/null || { echo "docker required"; exit 1; }
 docker exec "$PG_CONTAINER" pg_isready -U "$PG_USER" >/dev/null 2>&1 || {
-  echo "start postgres first: docker run -d --name hp-pg -e POSTGRES_PASSWORD=hp -e POSTGRES_DB=hp -p 5433:5432 postgres:16-alpine"
+  echo "start postgres first: docker run -d --name hp-pg -e POSTGRES_PASSWORD=hp -e POSTGRES_DB=hp -p 5436:5432 postgres:16-alpine"
   exit 1
 }
 

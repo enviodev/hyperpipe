@@ -1157,12 +1157,21 @@ dependencies = [
  "bytes",
  "hp-encoding",
  "hp-engine",
+ "hp-testutil",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "hp-testutil"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1174,6 +1183,7 @@ dependencies = [
  "hex",
  "hp-encoding",
  "hp-engine",
+ "hp-testutil",
  "object_store",
  "reqwest",
  "serde",

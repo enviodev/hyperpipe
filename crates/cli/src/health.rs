@@ -82,3 +82,140 @@ async fn serve(port: u16) -> std::io::Result<()> {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// `STATE` and `HYPERPIPE_HEALTH_PORT` are process-global.
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    /// Bind an ephemeral port and serve on it; returns the port.
+    async fn spawn_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // free it for serve() to take (racy in theory, fine here)
+        tokio::spawn(async move {
+            let _ = serve(port).await;
+        });
+        // Wait for the listener to come up rather than sleeping blind.
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                return port;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("health server never came up on port {port}");
+    }
+
+    /// GET `path` and return (status code, body).
+    async fn get(port: u16, path: &str) -> (u16, String) {
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+        sock.write_all(format!("GET {path} HTTP/1.1\r\nhost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        sock.read_to_string(&mut resp).await.unwrap();
+        let code: u16 = resp
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (code, body)
+    }
+
+    #[tokio::test]
+    async fn no_env_var_means_no_health_server() {
+        let _g = LOCK.lock().unwrap();
+        let saved = std::env::var_os("HYPERPIPE_HEALTH_PORT");
+        std::env::remove_var("HYPERPIPE_HEALTH_PORT");
+        assert!(maybe_spawn().is_none(), "the probe server is opt-in");
+        if let Some(v) = saved {
+            std::env::set_var("HYPERPIPE_HEALTH_PORT", v);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_junk_port_disables_the_server_without_killing_the_pipeline() {
+        // A typo in the env var must not take the whole pipeline down.
+        let _g = LOCK.lock().unwrap();
+        let saved = std::env::var_os("HYPERPIPE_HEALTH_PORT");
+        std::env::set_var("HYPERPIPE_HEALTH_PORT", "not-a-port");
+        assert!(maybe_spawn().is_none());
+        std::env::set_var("HYPERPIPE_HEALTH_PORT", "99999"); // out of u16 range
+        assert!(maybe_spawn().is_none());
+        match saved {
+            Some(v) => std::env::set_var("HYPERPIPE_HEALTH_PORT", v),
+            None => std::env::remove_var("HYPERPIPE_HEALTH_PORT"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_valid_port_spawns_the_server() {
+        let _g = LOCK.lock().unwrap();
+        let saved = std::env::var_os("HYPERPIPE_HEALTH_PORT");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        std::env::set_var("HYPERPIPE_HEALTH_PORT", port.to_string());
+        let handle = maybe_spawn().expect("spawned");
+        handle.abort();
+        match saved {
+            Some(v) => std::env::set_var("HYPERPIPE_HEALTH_PORT", v),
+            None => std::env::remove_var("HYPERPIPE_HEALTH_PORT"),
+        }
+    }
+
+    /// The full K8s contract, in lifecycle order, against one live server.
+    #[tokio::test]
+    async fn probes_track_the_pipeline_lifecycle() {
+        let _g = LOCK.lock().unwrap();
+        let port = spawn_server().await;
+
+        // STARTING: alive, but not ready for traffic.
+        set_state(STARTING);
+        assert_eq!(get(port, "/healthz").await, (200, "ok".into()));
+        assert_eq!(get(port, "/readyz").await, (503, "starting".into()));
+
+        // RUNNING: both green.
+        set_state(RUNNING);
+        assert_eq!(get(port, "/healthz").await, (200, "ok".into()));
+        assert_eq!(get(port, "/readyz").await, (200, "ready".into()));
+
+        // STOPPING (draining after SIGTERM): liveness goes red so the pod is
+        // pulled out of rotation rather than restarted mid-drain.
+        set_state(STOPPING);
+        assert_eq!(get(port, "/healthz").await.0, 503);
+        assert_eq!(get(port, "/readyz").await.0, 503);
+
+        set_state(RUNNING);
+    }
+
+    #[tokio::test]
+    async fn unknown_paths_answer_like_healthz() {
+        let _g = LOCK.lock().unwrap();
+        let port = spawn_server().await;
+        set_state(RUNNING);
+        assert_eq!(get(port, "/").await, (200, "ok".into()));
+        assert_eq!(get(port, "/anything").await, (200, "ok".into()));
+        // ...including while draining
+        set_state(STOPPING);
+        assert_eq!(get(port, "/anything").await.0, 503);
+        set_state(RUNNING);
+    }
+
+    #[tokio::test]
+    async fn readyz_matches_on_the_path_prefix() {
+        // kubelet appends nothing, but a query string must still route.
+        let _g = LOCK.lock().unwrap();
+        let port = spawn_server().await;
+        set_state(RUNNING);
+        assert_eq!(get(port, "/readyz?probe=1").await, (200, "ready".into()));
+    }
+}

@@ -8,3 +8,8 @@
 *.cwasm
 /dist
 pipeline.env
+
+# Coverage: instrumented binaries drop these wherever they are run from
+# (LLVM_PROFILE_FILE only redirects them when it is exported).
+*.profraw
+*.profdata

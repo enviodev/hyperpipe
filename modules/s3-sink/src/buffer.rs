@@ -390,4 +390,109 @@ mod tests {
         };
         assert_eq!(build(), build());
     }
+
+    #[test]
+    fn config_requires_a_connection() {
+        let e = S3Config::from_json(&json!({})).err().unwrap();
+        assert!(e.contains("config.connection required"), "got {e}");
+        assert!(S3Config::from_json(&json!({ "connection": 5 })).is_err());
+    }
+
+    #[test]
+    fn config_rejects_unknown_formats_and_takes_explicit_ndjson() {
+        let e = S3Config::from_json(&json!({ "connection": "lake", "format": "csv" })).err().unwrap();
+        assert!(e.contains("unknown format `csv`"), "got {e}");
+
+        let c = S3Config::from_json(&json!({ "connection": "lake", "format": "ndjson" })).unwrap();
+        assert_eq!(c.format, Format::Ndjson);
+        assert_eq!(c.connection, "lake");
+    }
+
+    #[test]
+    fn flush_rows_zero_clamps_to_one() {
+        // 0 would mean "flush a buffer that is never full" — every take_ready
+        // call would emit an empty object. Clamp to 1.
+        let c = S3Config::from_json(&json!({ "connection": "lake", "flush_rows": 0 })).unwrap();
+        assert_eq!(c.flush_rows, 1);
+        let c = S3Config::from_json(&json!({ "connection": "lake", "flush_rows": 250 })).unwrap();
+        assert_eq!(c.flush_rows, 250);
+    }
+
+    #[test]
+    fn format_extensions() {
+        assert_eq!(Format::Parquet.ext(), "parquet");
+        assert_eq!(Format::Ndjson.ext(), "ndjson");
+    }
+
+    #[test]
+    fn pushing_no_records_leaves_the_buffer_untouched() {
+        let mut b = Buffer::default();
+        b.push(1, 500, 510, &[]);
+        assert!(b.is_empty());
+        assert_eq!(b.len(), 0);
+        // `seen` stayed false: the next real push sets first_block, not 500.
+        b.push(1, 100, 110, &recs(1));
+        assert_eq!(b.first_block, 100);
+        assert_eq!(b.object_key(Format::Ndjson), "1/100-110-1.ndjson");
+    }
+
+    #[test]
+    fn parquet_of_records_with_no_columns_errors() {
+        // Every record is a non-object -> no columns to infer a schema from.
+        let e = to_parquet(&[json!("junk"), json!(42)]).err().unwrap();
+        assert!(e.contains("cannot infer schema"), "got {e}");
+        assert!(column_order(&[json!("junk")]).is_empty());
+    }
+
+    #[test]
+    fn cell_to_string_renders_every_json_shape() {
+        assert_eq!(cell_to_string(None), None);
+        assert_eq!(cell_to_string(Some(&json!(null))), None);
+        assert_eq!(cell_to_string(Some(&json!("x"))), Some("x".to_string()));
+        assert_eq!(cell_to_string(Some(&json!(true))), Some("true".to_string()));
+        assert_eq!(cell_to_string(Some(&json!(42))), Some("42".to_string()));
+        assert_eq!(cell_to_string(Some(&json!(1.5))), Some("1.5".to_string()));
+        // nested values become JSON text rather than being dropped
+        assert_eq!(cell_to_string(Some(&json!({"a": 1}))), Some("{\"a\":1}".to_string()));
+        assert_eq!(cell_to_string(Some(&json!([1, 2]))), Some("[1,2]".to_string()));
+    }
+
+    #[test]
+    fn take_ready_below_threshold_emits_nothing() {
+        let mut cb = ChainBuffers::default();
+        cb.push(1, 100, 110, &recs(4));
+        assert!(cb.take_ready(Format::Ndjson, 5).unwrap().is_empty());
+        // the buffer kept its rows for the next round
+        cb.push(1, 110, 120, &recs(1));
+        let ready = cb.take_ready(Format::Ndjson, 5).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, "1/100-120-5.ndjson");
+    }
+
+    #[test]
+    fn take_all_on_an_untouched_buffer_is_empty() {
+        let mut cb = ChainBuffers::default();
+        assert!(cb.take_all(Format::Parquet).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_flushed_buffer_starts_a_fresh_range() {
+        // take() resets `seen`, so the next object's key must start at the new
+        // range's first block — not at the flushed object's.
+        let mut b = Buffer::default();
+        b.push(1, 100, 110, &recs(2));
+        assert_eq!(b.take(Format::Ndjson).unwrap().unwrap().0, "1/100-110-2.ndjson");
+        b.push(1, 200, 210, &recs(1));
+        assert_eq!(b.object_key(Format::Ndjson), "1/200-210-1.ndjson");
+    }
+
+    #[test]
+    fn record_block_number_parsing_variants() {
+        assert_eq!(record_block_number(&json!({"block_number": 42})), Some(42));
+        assert_eq!(record_block_number(&json!({"block_number": "42"})), Some(42));
+        assert_eq!(record_block_number(&json!({"block_number": "0x2a"})), Some(42));
+        assert_eq!(record_block_number(&json!({"block_number": "junk"})), None);
+        assert_eq!(record_block_number(&json!({"block_number": true})), None);
+        assert_eq!(record_block_number(&json!({})), None);
+    }
 }

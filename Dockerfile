@@ -8,7 +8,10 @@ COPY . .
 # Native binary (rustls TLS -> no OpenSSL needed at runtime).
 RUN cargo build --release -p hp-cli
 # Guest WASM modules (separate workspace under modules/).
-RUN cd modules && cargo build --release --target wasm32-wasip2
+# --exclude test-chaos: that module traps/spins/OOMs on purpose (a test fixture).
+# The release artifacts get copied wholesale into the image below, so it must not
+# be built here.
+RUN cd modules && cargo build --release --target wasm32-wasip2 --workspace --exclude test-chaos
 
 # ---------- runtime stage ----------
 FROM debian:bookworm-slim

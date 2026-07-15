@@ -22,3 +22,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 bytes = { workspace = true }
 object_store = { version = "0.11", features = ["aws"] }
+
+[dev-dependencies]
+hp-testutil = { workspace = true }
+sqlx = { workspace = true }

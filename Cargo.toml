@@ -6,6 +6,7 @@ members = [
     "crates/source-hypersync",
     "crates/wasm-host",
     "crates/encoding",
+    "crates/testutil",
 ]
 # Guest (wasm) crates live in modules/ with their own workspace; they build for
 # wasm32-wasip2 and must not be pulled into the native `cargo build`.
@@ -23,6 +24,7 @@ hp-encoding = { path = "crates/encoding" }
 hp-engine = { path = "crates/engine" }
 hp-source-hypersync = { path = "crates/source-hypersync" }
 hp-wasm-host = { path = "crates/wasm-host" }
+hp-testutil = { path = "crates/testutil" }
 
 # runtime
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "net", "io-util"] }
