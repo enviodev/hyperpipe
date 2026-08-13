@@ -1,0 +1,22 @@
+[
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": false, "name": "inputToken", "type": "bytes32" },
+      { "indexed": false, "name": "outputToken", "type": "bytes32" },
+      { "indexed": false, "name": "inputAmount", "type": "uint256" },
+      { "indexed": false, "name": "outputAmount", "type": "uint256" },
+      { "indexed": true, "name": "destinationChainId", "type": "uint256" },
+      { "indexed": true, "name": "depositId", "type": "uint256" },
+      { "indexed": false, "name": "quoteTimestamp", "type": "uint32" },
+      { "indexed": false, "name": "fillDeadline", "type": "uint32" },
+      { "indexed": false, "name": "exclusivityDeadline", "type": "uint32" },
+      { "indexed": true, "name": "depositor", "type": "bytes32" },
+      { "indexed": false, "name": "recipient", "type": "bytes32" },
+      { "indexed": false, "name": "exclusiveRelayer", "type": "bytes32" },
+      { "indexed": false, "name": "message", "type": "bytes" }
+    ],
+    "name": "FundsDeposited",
+    "type": "event"
+  }
+]
