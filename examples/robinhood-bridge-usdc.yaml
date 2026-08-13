@@ -13,8 +13,11 @@
 #      WASM filter then keeps USDC-input deposits.
 #
 # Both routes are topic-filtered server-side (HyperSync only ships bridge
-# traffic), decoded, written to Postgres (one table per route), and large
-# flows (>= $100k) from either route fan in to one webhook.
+# traffic) and decoded. Deposits and withdrawal claims run as separate
+# streams: the full history (both directions) lands in Postgres, while only
+# genuinely inbound flows (canonical deposits + Across deposits) >= $100k fan
+# in to the whale-alert webhook — an L1 withdrawal claim is the tail end of a
+# Robinhood -> Ethereum exit, not an inbound deposit, so it never alerts.
 #
 # L1 contracts (docs.robinhood.com/chain/protocol-contracts, across.to):
 #   L1 ERC20 Gateway   0x85001CC4867C5e1C22dA4B79BB8852B9e2a06da0
@@ -36,7 +39,8 @@ runtime:
     path: ./state/robinhood-bridge.db
 
 sources:
-  - name: eth_bridge_usdc
+  # Canonical-bridge deposits: USDC Transfer(from=*, to=L1 ERC20 Gateway)
+  - name: eth_gateway_deposits
     type: hypersync
     chain: ethereum
     mode: live
@@ -47,13 +51,29 @@ sources:
       window: 64
     query:
       logs:
-        # Deposits: USDC Transfer(from=*, to=L1 ERC20 Gateway)
         - address: ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
           topics:
             - ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]
             - []
             - ["0x00000000000000000000000085001cc4867c5e1c22da4b79bb8852b9e2a06da0"]
-        # Withdrawals: USDC Transfer(from=L1 ERC20 Gateway, to=*)
+      field_selection:
+        log: [address, topic0, topic1, topic2, topic3, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+  # Withdrawal claims: USDC Transfer(from=L1 ERC20 Gateway, to=*). This is
+  # the final L1 step of a Robinhood -> Ethereum exit — kept for the history
+  # table, deliberately excluded from the inbound whale alert.
+  - name: eth_gateway_withdrawals
+    type: hypersync
+    chain: ethereum
+    mode: live
+    from_block: 25435000       # ~2026-07-01, Robinhood Chain mainnet launch
+    confirmations: 10
+    reorg:
+      enabled: true
+      window: 64
+    query:
+      logs:
         - address: ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
           topics:
             - ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]
@@ -83,9 +103,18 @@ sources:
         block: [number, timestamp, hash]
 
 processors:
-  - name: decode
+  - name: decode_deposits
     module: builtin/evm-abi-decoder@1
-    inputs: [eth_bridge_usdc]
+    inputs: [eth_gateway_deposits]
+    config:
+      abis:
+        - file: ./abis/erc20.json
+          events: [Transfer]
+      on_undecodable: drop
+
+  - name: decode_withdrawals
+    module: builtin/evm-abi-decoder@1
+    inputs: [eth_gateway_withdrawals]
     config:
       abis:
         - file: ./abis/erc20.json
@@ -112,9 +141,10 @@ processors:
           op: eq
           value: "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 
-  - name: big_flows
+  # Inbound-only: canonical deposits (withdrawal claims never reach this).
+  - name: big_deposits
     module: builtin/filter@1
-    inputs: [decode]
+    inputs: [decode_deposits]
     config:
       all:
         # USDC has 6 decimals; $100k = 100000 * 1e6.
@@ -128,11 +158,11 @@ processors:
         - { field: params.inputAmount, op: gte, value: "100000000000" }
 
 sinks:
-  # Full bridge history (deposits + withdrawals in one table; direction is
-  # `to_address = gateway` -> deposit, `from_address = gateway` -> withdrawal).
+  # Full bridge history (deposits + withdrawal claims in one table; direction
+  # is `to_address = gateway` -> deposit, `from_address = gateway` -> claim).
   - name: pg_bridge_flows
     module: builtin/postgres@1
-    inputs: [decode]
+    inputs: [decode_deposits, decode_withdrawals]
     connections: [pg_main]
     config:
       connection: pg_main
@@ -164,9 +194,10 @@ sinks:
         params.recipient: recipient
         params.depositId: deposit_id
 
+  # Inbound flows only: canonical deposits + Across deposits.
   - name: whale_alerts
     module: builtin/webhook@1
-    inputs: [big_flows, big_across]
+    inputs: [big_deposits, big_across]
     permissions:
       http: ["hooks.slack.com"]
     config:
