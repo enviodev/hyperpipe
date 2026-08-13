@@ -1,0 +1,212 @@
+# Robinhood Chain bridge monitor: USDC flows from Ethereum mainnet, both
+# bridge routes.
+#
+# Robinhood Chain (chain id 4663, mainnet since 2026-07-01) is an Arbitrum
+# Orbit L2 with two USDC routes from Ethereum:
+#
+#   1. Canonical bridge — escrows deposits in the L1 ERC20 Gateway, so every
+#      deposit is a plain `Transfer(user -> gateway)` and every executed
+#      withdrawal a `Transfer(gateway -> user)` on the USDC contract.
+#   2. Across (intent bridge, the popular fast path) — a `FundsDeposited`
+#      event on the Ethereum SpokePool with indexed destinationChainId,
+#      so "deposits to Robinhood" (4663 = 0x1237) filter server-side; a
+#      WASM filter then keeps USDC-input deposits.
+#
+# Both routes are topic-filtered server-side (HyperSync only ships bridge
+# traffic) and decoded. Deposits and withdrawal claims run as separate
+# streams: the full history (both directions) lands in Postgres, while only
+# genuinely inbound flows (canonical deposits + Across deposits) >= $100k fan
+# in to the whale-alert webhook — an L1 withdrawal claim is the tail end of a
+# Robinhood -> Ethereum exit, not an inbound deposit, so it never alerts.
+#
+# L1 contracts (docs.robinhood.com/chain/protocol-contracts, across.to):
+#   L1 ERC20 Gateway   0x85001CC4867C5e1C22dA4B79BB8852B9e2a06da0
+#   L1 Gateway Router  0x6a2E3a1e16FC29f27Ce61429746D558d656975bB
+#   Across SpokePool   0x5c7BCd6E7De5423a257D81B442095A1a6ced35C5
+#
+# Secrets (set before `hyperpipe run`):
+#   export HYPERPIPE_SECRET_PG_MAIN_DSN='postgres://user:pw@localhost:5432/hyperpipe'
+#   export HYPERPIPE_SECRET_WEBHOOK_URL='https://hooks.slack.com/services/...'
+# Or skip both and watch the stream directly:
+#   hyperpipe run examples/robinhood-bridge-usdc.yaml --debug-stdout
+name: robinhood-bridge-usdc
+version: 1
+
+runtime:
+  resource_size: s
+  checkpoint:
+    store: sqlite
+    path: ./state/robinhood-bridge.db
+
+sources:
+  # Canonical-bridge deposits: USDC Transfer(from=*, to=L1 ERC20 Gateway)
+  - name: eth_gateway_deposits
+    type: hypersync
+    chain: ethereum
+    mode: live
+    from_block: 25435000       # ~2026-07-01, Robinhood Chain mainnet launch
+    confirmations: 10
+    reorg:
+      enabled: true
+      window: 64
+    query:
+      logs:
+        - address: ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+          topics:
+            - ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]
+            - []
+            - ["0x00000000000000000000000085001cc4867c5e1c22da4b79bb8852b9e2a06da0"]
+      field_selection:
+        log: [address, topic0, topic1, topic2, topic3, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+  # Withdrawal claims: USDC Transfer(from=L1 ERC20 Gateway, to=*). This is
+  # the final L1 step of a Robinhood -> Ethereum exit — kept for the history
+  # table, deliberately excluded from the inbound whale alert.
+  - name: eth_gateway_withdrawals
+    type: hypersync
+    chain: ethereum
+    mode: live
+    from_block: 25435000       # ~2026-07-01, Robinhood Chain mainnet launch
+    confirmations: 10
+    reorg:
+      enabled: true
+      window: 64
+    query:
+      logs:
+        - address: ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+          topics:
+            - ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]
+            - ["0x00000000000000000000000085001cc4867c5e1c22da4b79bb8852b9e2a06da0"]
+      field_selection:
+        log: [address, topic0, topic1, topic2, topic3, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+  - name: eth_across_deposits
+    type: hypersync
+    chain: ethereum
+    mode: live
+    from_block: 25435000       # ~2026-07-01, Robinhood Chain mainnet launch
+    confirmations: 10
+    reorg:
+      enabled: true
+      window: 64
+    query:
+      logs:
+        # Across FundsDeposited with destinationChainId = 4663 (0x1237)
+        - address: ["0x5c7BCd6E7De5423a257D81B442095A1a6ced35C5"]
+          topics:
+            - ["0x32ed1a409ef04c7b0227189c3a103dc5ac10e775a15b785dcc510201f7c25ad3"]
+            - ["0x0000000000000000000000000000000000000000000000000000000000001237"]
+      field_selection:
+        log: [address, topic0, topic1, topic2, topic3, data, block_number, log_index, transaction_hash]
+        block: [number, timestamp, hash]
+
+processors:
+  - name: decode_deposits
+    module: builtin/evm-abi-decoder@1
+    inputs: [eth_gateway_deposits]
+    config:
+      abis:
+        - file: ./abis/erc20.json
+          events: [Transfer]
+      on_undecodable: drop
+
+  - name: decode_withdrawals
+    module: builtin/evm-abi-decoder@1
+    inputs: [eth_gateway_withdrawals]
+    config:
+      abis:
+        - file: ./abis/erc20.json
+          events: [Transfer]
+      on_undecodable: drop
+
+  - name: decode_across
+    module: builtin/evm-abi-decoder@1
+    inputs: [eth_across_deposits]
+    config:
+      abis:
+        - file: ./abis/across-spokepool.json
+          events: [FundsDeposited]
+      on_undecodable: drop
+
+  # Across carries many assets; keep deposits whose input token is USDC
+  # (addresses are bytes32-padded in the V3.5 event).
+  - name: across_usdc
+    module: builtin/filter@1
+    inputs: [decode_across]
+    config:
+      all:
+        - field: params.inputToken
+          op: eq
+          value: "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+
+  # Inbound-only: canonical deposits (withdrawal claims never reach this).
+  - name: big_deposits
+    module: builtin/filter@1
+    inputs: [decode_deposits]
+    config:
+      all:
+        # USDC has 6 decimals; $100k = 100000 * 1e6.
+        - { field: params.value, op: gte, value: "100000000000" }
+
+  - name: big_across
+    module: builtin/filter@1
+    inputs: [across_usdc]
+    config:
+      all:
+        - { field: params.inputAmount, op: gte, value: "100000000000" }
+
+sinks:
+  # Full bridge history (deposits + withdrawal claims in one table; direction
+  # is `to_address = gateway` -> deposit, `from_address = gateway` -> claim).
+  - name: pg_bridge_flows
+    module: builtin/postgres@1
+    inputs: [decode_deposits, decode_withdrawals]
+    connections: [pg_main]
+    config:
+      connection: pg_main
+      table: robinhood_bridge_usdc
+      mode: upsert
+      unique_key: [chain_id, block_number, log_index]
+      create_table: true
+      rollback: true           # reorg: delete rows past the fork before replay
+      column_map:
+        params.from: from_address
+        params.to: to_address
+        params.value: amount
+
+  - name: pg_across_deposits
+    module: builtin/postgres@1
+    inputs: [across_usdc]
+    connections: [pg_main]
+    config:
+      connection: pg_main
+      table: across_robinhood_usdc
+      mode: upsert
+      unique_key: [chain_id, block_number, log_index]
+      create_table: true
+      rollback: true
+      column_map:
+        params.inputAmount: amount
+        params.outputAmount: output_amount
+        params.depositor: depositor
+        params.recipient: recipient
+        params.depositId: deposit_id
+
+  # Inbound flows only: canonical deposits + Across deposits.
+  - name: whale_alerts
+    module: builtin/webhook@1
+    inputs: [big_deposits, big_across]
+    permissions:
+      http: ["hooks.slack.com"]
+    config:
+      url: ${secret:WEBHOOK_URL}
+      max_batch: 20
+      retry: { attempts: 5, backoff_ms: 1000, max_backoff_ms: 30000 }
+
+connections:
+  pg_main:
+    type: postgres
+    dsn: ${secret:PG_MAIN_DSN}
+    pool: { max: 8 }

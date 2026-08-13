@@ -12,6 +12,7 @@ source `chain` for a mock `url` to run offline (see [../DEMO.md](../DEMO.md)).
 | `ondo-stocks-s3-parquet.yaml` | data-lake archive | **s3** (buffered Parquet, flush every 5k rows) | ethereum |
 | `stock-whale-alerts.yaml` | threshold filter → alert | **filter + webhook** (allowlist-gated) | ethereum |
 | `rwa-multi-sink.yaml` | DAG fan-out: one decode → 3 sinks | **postgres + s3 + webhook** | ethereum |
+| `robinhood-bridge-usdc.yaml` | bridge monitor: server-side topic filters, both routes (USDC ↔ Robinhood Chain canonical bridge + Across deposits), whale alerts on large inbound flows | postgres + webhook | ethereum |
 
 Contracts (Backed xStocks + Ondo Global Markets), all emitting `Transfer(address,address,uint256)`:
 
