@@ -11,8 +11,10 @@ setup "03-crash-recovery"
 require_pg
 command -v sqlite3 >/dev/null || skip "sqlite3 needed to inspect the checkpoint db"
 
-# crash-test.sh owns its own workdir (/tmp/hpcrash) and pg target; hand it ours.
-PG_CONTAINER="$PG_CONTAINER" PG_USER="$PG_USER" PG_DB="$PG_DB" PG_DSN="$PG_DSN" \
+# crash-test.sh picks its own pg target from these; hand it ours, plus a private
+# workdir of our own so the checkpoint db can be inspected afterwards.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/hpcrash.XXXXXX")
+WORK="$WORK" PG_CONTAINER="$PG_CONTAINER" PG_USER="$PG_USER" PG_DB="$PG_DB" PG_DSN="$PG_DSN" \
   timeout 300 "$ROOT/scripts/crash-test.sh" >>"$LOG" 2>&1
 rc=$?
 if [ $rc -ne 0 ]; then
@@ -23,7 +25,7 @@ grep -q '^PASS' "$LOG" || fail "crash-test.sh did not report PASS"
 
 # The added assertion: the cursor is durable at END, so a further restart would
 # fetch nothing rather than replaying the range.
-CK=/tmp/hpcrash/ck.db
+CK="$WORK/ck.db"
 [ -f "$CK" ] || fail "expected a checkpoint db at $CK"
 END=19000300
 rows=$(sqlite3 "$CK" 'select source, sink, next_block from cursors;')

@@ -43,8 +43,10 @@ BIN="$ROOT/target/debug/hyperpipe"
 [ -x "$BIN" ] || { echo "build first: cargo build"; exit 1; }
 
 # Private scratch dir: the pipeline YAML written here carries the Postgres
-# DSN, so it must not live at a fixed, world-writable path.
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/hpreorg.XXXXXX")
+# DSN, so it must not live at a fixed, world-writable path. Callers that want
+# to inspect the checkpoint afterwards (scripts/e2e/03) pass WORK themselves.
+WORK="${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/hpreorg.XXXXXX")}"
+mkdir -p "$WORK"
 echo "workdir: $WORK"
 cp "$ROOT/examples/abis/erc20.json" "$WORK/erc20.json"
 docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -c "DROP TABLE IF EXISTS reorg_test;" >/dev/null
