@@ -187,4 +187,4 @@ then pauses that branch (nothing is silently dropped). A hung module is killed a
 deadline (5–10 s); memory is capped per `resource_size`.
 
 Rust is supported today; TypeScript (via jco) and Go (TinyGo) target the same WIT contract
-and are on the phase-1 roadmap.
+but do not have SDKs yet.

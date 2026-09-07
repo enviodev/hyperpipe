@@ -1,10 +1,8 @@
 # HyperPipe — WASM Data Pipelines on HyperSync
 
-> **Working title.** "HyperPipe" is a placeholder — rename freely.
->
 > **Status:** Architecture spec v0.1 · 2026-07-02
-> **Audience:** Implementing engineer(s). This doc is the source of truth for the hackathon build and the phase plan beyond it.
-> **Positioning:** A direct alternative to **Goldsky Turbo** — real-time + backfill blockchain data pipelines — built on **Envio HyperSync** as the ingestion layer, with **WASM modules** as the extensibility layer.
+> **Scope:** The system design and the rationale behind it. Section refs (§) in code and docs point here.
+> **What it is:** Real-time + backfill blockchain data pipelines, built on **Envio HyperSync** as the ingestion layer, with **WASM modules** as the extensibility layer.
 
 ---
 
@@ -24,26 +22,24 @@ The engine wires these together, streams data through, checkpoints progress, and
 hyperpipe run pipeline.yaml
 ```
 
-### 1.2 Why it beats Goldsky Turbo
+### 1.2 Design properties
 
-| Dimension | Goldsky Turbo | HyperPipe |
-|---|---|---|
-| Ingestion | Proprietary streams | **HyperSync — up to 2000x faster than RPC**, 70+ EVM chains + Fuel, any EVM chain via RPC fallback |
-| Backfill speed | Good | **Exceptional** — HyperSync's core strength; historical ranges stream in minutes, not days |
-| Transforms | SQL + TypeScript (their sandbox, their languages) | **Any language that compiles to WASM** (Rust, TS via jco, Go, AssemblyScript) + built-in module library |
-| Sinks | Fixed set they operate | Built-in set **+ user-supplied WASM sinks** — bring your own destination |
-| Extensibility | Closed | **Open module interface (WIT)** — swap/replace every stage |
-| Sandboxing | Their infra | **Capability-based**: a module can only reach hosts/connections the YAML grants it |
-| Deployment | Their cloud only | **Self-hosted single binary** first; hosted control plane later |
-| Delivery | At-least-once | At-least-once (parity), idempotent sink support |
-| Startup | <5s claim | Same target via precompiled WASM cache |
+- **Ingestion:** HyperSync — up to 2000x faster than RPC, 70+ EVM chains + Fuel; any other EVM chain via RPC fallback.
+- **Backfill:** HyperSync's core strength; historical ranges stream in minutes.
+- **Transforms:** any language that compiles to a WASM component (Rust today; TS via jco, Go, AssemblyScript target the same WIT) plus a built-in module library.
+- **Sinks:** built-in set **+ user-supplied WASM sinks** — bring your own destination.
+- **Extensibility:** an open module interface (WIT); every stage can be swapped or replaced.
+- **Sandboxing:** capability-based — a module can only reach the hosts and connections the YAML grants it.
+- **Deployment:** self-hosted single binary.
+- **Delivery:** at-least-once, with idempotent sink support.
+- **Startup:** sub-5s target via a precompiled WASM cache.
 
-Known gaps vs Turbo (be honest in demos): no Solana/NEAR/Bitcoin/Stellar (HyperSync is EVM + Fuel), no SQL transforms yet (see §12 — DataFusion is the planned answer).
+Current limitations: chains are those HyperSync serves (EVM + Fuel; no Solana/NEAR/Bitcoin/Stellar) and there are no SQL transforms.
 
 ### 1.3 Non-goals (for now)
 
-- No hosted/multi-tenant control plane (phase 3).
-- No exactly-once semantics — at-least-once + idempotent sinks, same as Turbo.
+- No hosted/multi-tenant control plane.
+- No exactly-once semantics — at-least-once + idempotent sinks.
 - No non-EVM chains beyond what HyperSync offers.
 - No GUI. CLI + YAML only.
 
@@ -111,7 +107,7 @@ One OS process. Inside it:
 Everything flowing between stages is a **batch**: an envelope + a list of records. Batches (not single records) cross the WASM boundary — this amortizes serialization and instance-call overhead and keeps the door open for vectorized (Arrow) execution later.
 
 ```jsonc
-// Batch envelope — encoding v1 = JSON (CBOR as fast-follow), v2 = Arrow IPC (phase 2)
+// Batch envelope — encoding v1 = JSON; CBOR and Arrow IPC reserved (§12)
 {
   "schema": "hyperpipe/batch/v1",
   "batch_id": "eth_usdc_logs:19000000:19000100:0",  // deterministic: source:from:to:seq
@@ -146,7 +142,7 @@ Record shapes for `log` / `transaction` / `block` / `trace` mirror HyperSync's f
 
 Batches with `kind: "control"` flow through the same channels, in order:
 
-- `{ "control": "rollback", "chain_id": 1, "invalidate_after_block": 19000050 }` — reorg (phase 2).
+- `{ "control": "rollback", "chain_id": 1, "invalidate_after_block": 19000050 }` — reorg (§5.2).
 - `{ "control": "checkpoint", ... }` — internal barrier marker (engine-only, never enters WASM).
 - `{ "control": "eof", "source": "..." }` — backfill source exhausted its range; lets job-mode pipelines terminate cleanly.
 
@@ -225,11 +221,11 @@ processors:
     module: builtin/filter@1
     inputs: [decode]
     config:
-      expr: 'params.value >= "1000000000000"'   # built-in filter DSL (CEL subset), phase 1
+      expr: 'params.value >= "1000000000000"'   # built-in filter DSL (CEL subset), planned
 
   - name: enrich                            # user-supplied custom module
     module:
-      file: ./modules/enrich.wasm           # local path; oci://... in phase 3
+      file: ./modules/enrich.wasm           # local path; oci://... reserved
     inputs: [big_transfers]
     permissions:                            # capability grants — empty by default
       http: ["api.coingecko.com"]           # host allowlist for host-http
@@ -310,7 +306,7 @@ loop:
 Key behaviors:
 
 - **HyperSync pagination**: responses return `next_block`; the loop is a simple cursor walk. HyperSync decides response sizing; we re-chunk to the YAML `batch.max_records`.
-- **Concurrency**: sources are fully independent tasks — 10 chains = 10 parallel streams. Phase 1 adds intra-source prefetch (pipeline the next HyperSync query while current batch drains) — the client's streaming API supports configurable concurrency.
+- **Concurrency**: sources are fully independent tasks — 10 chains = 10 parallel streams. Intra-source prefetch (pipelining the next HyperSync query while the current batch drains) is planned — the client's streaming API supports configurable concurrency.
 - **`both` mode**: run backfill loop to (head at start − confirmations), then switch to live polling. One cursor, seamless.
 - **Chain registry**: a built-in `chains.toml` mapping names → HyperSync URLs + chain_ids (ethereum, base, arbitrum, optimism, polygon, ...). `url:` override for anything else. `HYPERSYNC_BEARER_TOKEN` env for authenticated tiers.
 - **Block metadata join**: when `field_selection.block` is present, HyperSync returns block data alongside logs; the source layer denormalizes (injects `block_timestamp`/`block_hash` into each log record) so downstream modules never join.
@@ -320,7 +316,7 @@ Key behaviors:
 Two independently configurable layers (both implemented):
 
 - **Safe distance:** `confirmations: N` lag — the source never emits past `head - N`. Users who set N above the chain's reorg depth can turn tracking off (`reorg: { enabled: false }`) and need no rollback machinery at all. `confirmations: 0` + tracking off is rejected at validation.
-- **Rollback tracking (`reorg: { enabled, window }`, default on, window 64):** the source keeps a bounded window of (block_number, block_hash) for emitted blocks — persisted via the checkpoint KV, so it survives restarts — and checks each response's HyperSync `rollback_guard` (`first_parent_hash` chain check + re-fetched block overlap) against it. On mismatch: locate the fork by re-fetching canonical hashes (`include_all_blocks` headers query), emit a `rollback` control record, rewind the cursor, and re-ingest. The checkpoint store write-through rewinds the durable cursor (the one sanctioned non-monotonic move; stale snapshots are floored at persist so they can't re-raise it). Sink handling: Postgres `DELETE WHERE block_number > ? AND chain_id = ?` (opt-in `rollback: true`), s3 purges its unflushed buffer, webhook forwards the control record. This matches Turbo's guarantee shape.
+- **Rollback tracking (`reorg: { enabled, window }`, default on, window 64):** the source keeps a bounded window of (block_number, block_hash) for emitted blocks — persisted via the checkpoint KV, so it survives restarts — and checks each response's HyperSync `rollback_guard` (`first_parent_hash` chain check + re-fetched block overlap) against it. On mismatch: locate the fork by re-fetching canonical hashes (`include_all_blocks` headers query), emit a `rollback` control record, rewind the cursor, and re-ingest. The checkpoint store write-through rewinds the durable cursor (the one sanctioned non-monotonic move; stale snapshots are floored at persist so they can't re-raise it). Sink handling: Postgres `DELETE WHERE block_number > ? AND chain_id = ?` (opt-in `rollback: true`), s3 purges its unflushed buffer, webhook forwards the control record.
 
 ---
 
@@ -332,9 +328,9 @@ Two independently configurable layers (both implemented):
 |---|---|---|
 | Runtime | **wasmtime** | Best-in-class component model support, epoch interruption, pooling allocator, Rust-native |
 | Interface | **WASM Component Model + WIT** | Typed, language-agnostic, versionable; `wit-bindgen` (Rust), `jco` (TS), TinyGo all target it |
-| Guest langs | Rust SDK (hackathon) → TS via jco (phase 1) → Go/AssemblyScript (phase 2) | TS parity with Turbo's TS transforms is the competitive must-have |
+| Guest langs | Rust SDK today; TS via jco, Go and AssemblyScript target the same WIT | Any language that compiles to a component works without host changes |
 | Boundary encoding | JSON bytes v1 → CBOR v1.5 → Arrow IPC v2 | Ship simple; the envelope's `encoding` tag makes upgrading non-breaking |
-| Cold start | Precompile to `.cwasm` cache dir at `apply`; mmap at `run` | Matches Turbo's <5s startup claim |
+| Cold start | Precompile to `.cwasm` cache dir at `apply`; mmap at `run` | Sub-5s startup target |
 | Runaway guests | Epoch-based interruption (per-call deadline, default 5s) + memory cap per `resource_size` | A bad module can't wedge the pipeline |
 | Instance model | Pool of N instances per stage; instance reuse across calls; `init()` once per instance | Amortize instantiation; modules may keep in-memory state (caches) but must not rely on it (§8) |
 
@@ -423,7 +419,7 @@ world sink {
 - `sql-exec`/`kafka-produce`/`blob-put` only accept connection names listed in that node's `connections`.
 - Secrets resolve host-side into connection pools; the DSN string never crosses into guest memory. A malicious custom module can at worst spam the connections it was explicitly granted.
 
-This is a genuine differentiator vs Turbo: user-defined code with a stated sandbox contract.
+User-defined code runs under a stated sandbox contract.
 
 ---
 
@@ -436,21 +432,21 @@ All built-ins are themselves WASM components compiled from Rust in this repo —
 | Module | Purpose | Config highlights | Phase |
 |---|---|---|---|
 | `evm-abi-decoder@1` | Raw logs → `decoded` records via ABI (alloy `abi` in WASM) | `abis[].file/events`, `on_undecodable: drop\|passthrough\|error`; topic0 → event lookup table built at `init` | **MVP** |
-| `filter@1` | Predicate filter | `expr` (CEL subset: field refs, comparisons, string/decimal numerics, `&& \|\| !`) | MVP (hardcoded ops) → phase 1 (CEL) |
-| `map@1` | Reshape/rename/drop fields | `select`, `rename`, `computed` (template strings) | Phase 1 |
-| `dedupe@1` | Drop duplicates within window | `key: [fields]`, `window_blocks` — uses `kv` for replay consistency | Phase 1 |
+| `filter@1` | Predicate filter | `expr` (CEL subset: field refs, comparisons, string/decimal numerics, `&& \|\| !`) | MVP (hardcoded ops); CEL planned |
+| `map@1` | Reshape/rename/drop fields | `select`, `rename`, `computed` (template strings) | Planned |
+| `dedupe@1` | Drop duplicates within window | `key: [fields]`, `window_blocks` — uses `kv` for replay consistency | Planned |
 
 ### Sinks
 
 | Module | Destination | Idempotency story | Phase |
 |---|---|---|---|
 | `stdout@1` | Console (NDJSON) — debugging + demo | n/a | **MVP** |
-| `blackhole@1` | Drop (throughput benchmarking — mirrors Turbo's) | n/a | **MVP** |
+| `blackhole@1` | Drop (throughput benchmarking) | n/a | **MVP** |
 | `postgres@1` | Postgres via `sql-batch` | `mode: upsert` + `unique_key` → `INSERT ... ON CONFLICT DO UPDATE`; auto-DDL opt-in | **MVP** |
 | `webhook@1` | HTTP POST batches | At-least-once, consumer dedupes on `batch_id`; retry w/ backoff | **MVP** |
-| `kafka@1` | Kafka/Redpanda | Key = `chain_id:block:log_index` → log-compaction dedupe | Phase 1 |
+| `kafka@1` | Kafka/Redpanda | Key = `chain_id:block:log_index` → log-compaction dedupe | Planned |
 | `s3@1` | Object store (S3 / R2 / MinIO / local dir), Parquet or NDJSON files | Buffered flush after N rows or interval; deterministic keys → re-flush overwrites idempotently (§7.1) | **MVP+** |
-| `clickhouse@1` | ClickHouse HTTP | `ReplacingMergeTree` + dedupe key | Phase 2 |
+| `clickhouse@1` | ClickHouse HTTP | `ReplacingMergeTree` + dedupe key | Planned |
 
 ### 7.1 s3 sink — buffered Parquet flush
 
@@ -494,7 +490,7 @@ sinks:
 
 **Schema:** inferred from the first buffered batch's record keys (columns in first-seen order,
 value types from JSON). Later rows are coerced to that schema; a divergent shape is an error
-(surfaced via the module error contract, §6.2). `strict_schema: false` (phase 1) will null-fill
+(surfaced via the module error contract, §6.2). `strict_schema: false` (planned) will null-fill
 instead.
 
 **Checkpoint interaction (the correctness subtlety):** a buffering sink acks `write()` as soon as
@@ -510,7 +506,7 @@ is lost, and duplicates collapse to the same object.
 
 ### 8.1 Guarantee
 
-**At-least-once, per sink.** After a crash, some batches may be re-delivered; sinks are idempotent (upsert/dedupe keys) or the consumer dedupes on `batch_id`. Never lost, possibly repeated. (Exactly Turbo's contract.)
+**At-least-once, per sink.** After a crash, some batches may be re-delivered; sinks are idempotent (upsert/dedupe keys) or the consumer dedupes on `batch_id`. Never lost, possibly repeated.
 
 ### 8.2 Mechanism
 
@@ -566,7 +562,7 @@ Rules:
 ## 9. Secrets
 
 - **MVP:** `${secret:NAME}` → env var `HYPERPIPE_SECRET_NAME`. Zero infra, works in CI.
-- **Phase 1:** `hyperpipe secret set NAME` → OS-keychain-encrypted local store (parity with `goldsky secret create`).
+- **Planned:** `hyperpipe secret set NAME` → OS-keychain-encrypted local store.
 - Resolution happens once at startup, host-side, into connection pools. Secrets never enter WASM memory, never appear in logs (redaction filter on the logging layer matches resolved values).
 
 ---
@@ -576,16 +572,16 @@ Rules:
 ```
 hyperpipe run pipeline.yaml            # foreground: validate → compile modules → stream (MVP)
 hyperpipe validate pipeline.yaml       # full §4.1 validation incl. module init dry-run (MVP)
-hyperpipe inspect pipeline.yaml -n decode   # live-tap a node's output, NDJSON to stdout (phase 1)
-hyperpipe modules list                 # built-ins + versions (phase 1)
-hyperpipe test module.wasm --input fixture.json --config cfg.json   # module conformance harness (phase 1)
-hyperpipe secret set NAME              # (phase 1)
-hyperpipe apply / status / logs        # daemon mode (phase 2)
+hyperpipe inspect pipeline.yaml -n decode   # live-tap a node's output, NDJSON to stdout (planned)
+hyperpipe modules list                 # built-ins + versions (planned)
+hyperpipe test module.wasm --input fixture.json --config cfg.json   # module conformance harness (planned)
+hyperpipe secret set NAME              # (planned)
+hyperpipe apply / status / logs        # daemon mode (planned)
 ```
 
-- **Inspect** (Turbo-parity feature, cheap to build): every inter-stage channel has an optional `tokio::broadcast` tap; `inspect` connects over a local unix socket and samples without applying backpressure (lossy by design — zero perf impact, same claim Turbo makes).
+- **Inspect** (planned): every inter-stage channel has an optional `tokio::broadcast` tap; `inspect` connects over a local unix socket and samples without applying backpressure (lossy by design — zero perf impact).
 - **Logs:** `tracing` crate, structured JSON option, module `log()` calls tagged with node name.
-- **Metrics (phase 1):** Prometheus endpoint — per-node records/s, bytes/s, batch latency histogram, retry counts, cursor lag vs chain head (the number users actually watch), WASM call duration.
+- **Metrics (planned):** Prometheus endpoint — per-node records/s, bytes/s, batch latency histogram, retry counts, cursor lag vs chain head (the number users actually watch), WASM call duration.
 - **`status` line during `run` (MVP):** one log line per source every 5s: `eth_usdc_logs: block 19,001,240 / head 19,001,250 (lag 10) | 4,200 rec/s | pg: ok, webhook: ok`.
 
 ---
@@ -603,40 +599,28 @@ hyperpipe apply / status / logs        # daemon mode (phase 2)
 ### 11.2 Where the time goes, and the plan
 
 1. **Ingestion** — HyperSync, native. Not our bottleneck; it's our headline.
-2. **Boundary serialization** — the known WASM tax. Mitigations: batches not records; `Bytes`/`Arc` zero-copy on the host side; encoding tag lets us swap JSON → CBOR (~3–5x) → Arrow IPC without interface changes. HyperSync can emit Arrow natively, so the v2 endgame is Arrow end-to-end: HyperSync → host → WASM (arrow-rs compiles to wasm) → Parquet/ClickHouse sinks, "vectorized" story matching Turbo's own marketing word.
+2. **Boundary serialization** — the known WASM tax. Mitigations: batches not records; `Bytes`/`Arc` zero-copy on the host side; encoding tag lets us swap JSON → CBOR (~3–5x) → Arrow IPC without interface changes. HyperSync can emit Arrow natively, so the v2 endgame is Arrow end-to-end: HyperSync → host → WASM (arrow-rs compiles to wasm) → Parquet/ClickHouse sinks.
 3. **WASM compute** — wasmtime is within ~10–50% of native for this workload shape; instance pooling + precompiled `.cwasm` handle the rest.
 4. **Sinks** — host-native drivers, pooled, `sql-batch` = one transaction per batch (thousands of rows per round-trip).
 
-### 11.3 Hackathon benchmark (build this into the demo)
+### 11.3 Reference benchmark
 
-Backfill 1M USDC Transfer events on Ethereum → decoded → Postgres. Report wall-clock + records/s vs a Turbo pipeline doing the same. HyperSync backfill should make this a rout. `blackhole` sink isolates ingestion+decode throughput.
+Backfill 1M USDC Transfer events on Ethereum → decoded → Postgres. Report wall-clock + records/s. The `blackhole` sink isolates ingestion + decode throughput from sink cost.
 
 ---
 
-## 12. Phasing & Cut-lines
+## 12. Not yet implemented
 
-### Phase 0 — Hackathon MVP (~3 days)
+The following are referenced by the YAML schema, the CLI sketch in §10 or the WIT contract, but are not implemented. The config layer parses or rejects them explicitly so pipelines fail fast rather than silently:
 
-**Goal: demo the money path.** Multi-chain HyperSync → WASM ABI decode → custom WASM filter → Postgres + webhook fan-out, kill -9 mid-run, restart, no data lost.
-
-- [ ] D1: Repo scaffold; config loader + validation; chain registry; HyperSync source loop (live + backfill, `confirmations`); envelope v1 (JSON); channels/DAG; `stdout` sink native-stubbed for first data flow
-- [ ] D1–2: wasmtime host + WIT (as §6.2, minus kafka/blob imports); Rust guest SDK crate (`hyperpipe-sdk`: derive-style wrapper hiding envelope codec + control passthrough); `evm-abi-decoder` built-in
-- [ ] D2: `postgres` sink (upsert + auto-DDL), `webhook` sink, `stdout`/`blackhole` as real WASM modules; SQLite checkpointing (§8.2); env secrets
-- [ ] D3: hardcoded-ops `filter` built-in; one custom example module (`examples/modules/`) proving the user-extensibility claim; benchmark script; demo pipeline YAML; polish `run` status output
-
-**MVP cut list (explicitly out):** inspect, metrics endpoint, reorg rollback, CEL, TS SDK, kafka/s3/clickhouse, daemon mode, `secret` CLI, module registry.
-
-### Phase 1 — Turbo feature parity (~2–3 weeks)
-
-`inspect` tap · Prometheus metrics · CEL filter + `map`/`dedupe` · kafka + s3 sinks · **TS guest SDK via jco** (the parity feature) · `secret` CLI · `hyperpipe test` module harness · CBOR encoding · intra-source prefetch.
-
-### Phase 2 — Beyond parity
-
-Reorg rollback control-flow + sink invalidation · Arrow IPC boundary + Parquet s3 sink · clickhouse sink · daemon mode (`apply`/`status`/`logs`) · Go/AssemblyScript SDKs · adaptive batching.
-
-### Phase 3 — Product bets (decide later)
-
-**SQL transforms via DataFusion** on Arrow batches (erases Turbo's SQL advantage; DataFusion is Rust, embeds cleanly, runs on exactly the Arrow batches phase 2 produces) · module registry (OCI) + community marketplace · hosted control plane · non-EVM sources if HyperSync expands.
+- `inspect`, `modules list`, `test`, `secret set`, and daemon mode (`apply` / `status` / `logs`) on the CLI
+- Prometheus `/metrics` endpoint
+- CEL filter expressions, `map` and `dedupe` built-ins
+- TypeScript (jco), Go and AssemblyScript guest SDKs
+- `kafka` and `clickhouse` sinks; the `kafka-produce` host import
+- `checkpoint.store: postgres`
+- CBOR / Arrow IPC boundary encodings (the envelope's `encoding` tag reserves them)
+- SQL transforms
 
 ---
 
@@ -663,40 +647,20 @@ datapipelines/
 │   ├── usdc-multichain.yaml      # the §4 demo pipeline
 │   ├── abis/erc20.json
 │   └── modules/enrich/           # custom-module example (user's starting template)
-└── docs/                         # this file; module-authoring guide (phase 1)
+└── docs/                         # this file; module-authoring guide
 ```
 
 Key deps: `tokio`, `wasmtime` (+component-model), `hypersync-client`, `alloy` (ABI, in decoder guest), `sqlx` (postgres + sqlite), `serde`/`serde_json`, `clap`, `tracing`, `wit-bindgen` (guests).
 
 ---
 
-## 14. Risks & Open Questions
+## 14. Known Risks
 
-| # | Risk / question | Assessment | Mitigation / owner call needed |
+| # | Risk | Assessment | Mitigation |
 |---|---|---|---|
-| 1 | JSON boundary too slow for headline benchmark | Likely fine for MVP (HyperSync dominates); measure D3 | CBOR is a contained swap; encoding tag designed for it |
-| 2 | Component-model TS story (jco) maturity | Phase 1 risk, not MVP | Fallback: QuickJS-in-WASM interpreter module running user JS (Turbo-style), keep WIT unchanged |
-| 3 | No Solana (HyperSync gap) | Real gap vs Turbo | Don't hide it; position as "best-in-class EVM+Fuel"; revisit if HyperSync roadmap covers it |
-| 4 | Auto-DDL in postgres sink is a footgun (schema drift) | Medium | Opt-in flag; log generated DDL; `strict_schema` mode phase 1 |
-| 5 | One slow sink stalls its sources (shared backpressure) | By design (correctness > availability) | Per-sink cursors already isolate restarts; phase 2: optional per-sink buffer spill to disk |
-| 6 | `sql-exec` generic interface enables SQL injection into *granted* connection | Accepted: module already has write access to that conn by grant; params are bound, not interpolated | Document; connections are the blast-radius boundary |
-| 7 | Product name | — | "HyperPipe" placeholder — decide before public repo |
-
-**Open for you (Nikhil):** (a) benchmark target — is beating Turbo on a public backfill number the hackathon's demo climax? (b) TS-SDK priority — pull jco into MVP if judges are TS-first? (c) name.
-
----
-
-## Appendix A — Turbo → HyperPipe concept map (for migration docs later)
-
-| Turbo | HyperPipe |
-|---|---|
-| `goldsky turbo apply f.yaml` | `hyperpipe run f.yaml` (daemon `apply` in phase 2) |
-| `goldsky turbo inspect` | `hyperpipe inspect -n <node>` |
-| `goldsky turbo logs` | `hyperpipe run` output / `logs` (phase 2) |
-| `goldsky secret create` | `${secret:NAME}` env (MVP), `hyperpipe secret set` (phase 1) |
-| Dataset source (`base.erc20_transfers`) | HyperSync source + query filter (raw) or decoder preset (curated presets = possible phase 3 sugar) |
-| SQL transform | `filter`/`map` built-ins now; DataFusion phase 3 |
-| TS transform | Custom WASM module (TS via jco, phase 1) |
-| Sink set | Built-in sinks + user WASM sinks |
-| `resource_size: s/m/l` | Same key, same values |
-| Job mode | `mode: backfill` + `to_block` (EOF terminates run) |
+| 1 | JSON boundary encoding limits throughput | HyperSync dominates for current workloads; measure before optimising | CBOR / Arrow IPC are contained swaps; the envelope's encoding tag is designed for it |
+| 2 | Component-model tooling maturity for TypeScript (jco) | Applies only to the planned TS SDK | Fallback: a QuickJS-in-WASM interpreter module running user JS, keeping the WIT unchanged |
+| 3 | Non-EVM chains unavailable | HyperSync serves EVM + Fuel | Documented as a limitation (§1.2) |
+| 4 | Auto-DDL in the postgres sink can drift schemas | Medium | Opt-in flag; generated DDL is logged; a `strict_schema` mode is planned |
+| 5 | One slow sink stalls its sources (shared backpressure) | By design (correctness > availability) | Per-sink cursors already isolate restarts; an optional per-sink disk spill buffer is a possible extension |
+| 6 | `sql-exec` lets a module run arbitrary SQL on a *granted* connection | Accepted: the grant already gives write access; params are bound, not interpolated | Documented; connections are the blast-radius boundary |

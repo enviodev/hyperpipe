@@ -21,7 +21,7 @@ connections: { ... }     # optional — named IO connections the host opens
 runtime:
   resource_size: s              # s (default) | m | l — see table below
   checkpoint:
-    store: sqlite               # sqlite (default) | postgres (reserved, phase 1)
+    store: sqlite               # sqlite (default) | postgres (reserved, not implemented)
     path: ./state/hyperpipe.db  # sqlite file path (default shown)
 ```
 
@@ -144,7 +144,7 @@ connections:
     prefix: usdc/                  # key prefix prepended to every object
     local_path: ./state/lake       # dev/test: write to a local dir, no credentials
 
-  # type: kafka                    # parses, wired in phase 1
+  # type: kafka                    # parses, not wired yet
 ```
 
 S3 credentials come from the host environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
