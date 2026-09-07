@@ -294,9 +294,7 @@ impl Runtime {
     }
 
     fn new_store(&self, node: &NodeCtx) -> Store<HostState> {
-        let limits = StoreLimitsBuilder::new()
-            .memory_size(self.cfg.wasm_mem_bytes)
-            .build();
+        let limits = store_limits(self.cfg.wasm_mem_bytes);
         let state = HostState::new(
             node.module_name.clone(),
             node.http_allow.clone(),
@@ -583,7 +581,7 @@ fn new_store_for(
     mem_bytes: usize,
     deadline: u64,
 ) -> Store<HostState> {
-    let limits = StoreLimitsBuilder::new().memory_size(mem_bytes).build();
+    let limits = store_limits(mem_bytes);
     let state = HostState::new(
         node.module_name.clone(),
         node.http_allow.clone(),
@@ -595,6 +593,32 @@ fn new_store_for(
     store.limiter(|s| &mut s.limits);
     store.set_epoch_deadline(deadline);
     store
+}
+
+/// Upper bound on core-module instances, linear memories and tables one
+/// module may create. A component built from a single Rust crate needs one
+/// of each (plus the wasip2 adapter, which imports its memory); a handful is
+/// plenty of headroom, and it puts a hard ceiling on the *total* memory a
+/// guest can claim: `MAX_MEMORIES * wasm_mem_bytes`.
+const MAX_INSTANCES: usize = 8;
+const MAX_MEMORIES: usize = 4;
+const MAX_TABLES: usize = 8;
+/// Function tables grow with the number of indirect-call targets; a guest
+/// asking for millions of elements is not a data pipeline stage.
+const MAX_TABLE_ELEMENTS: usize = 1 << 20;
+
+/// Resource limits for one guest store. `memory_size` is a *per-memory* cap
+/// in wasmtime, so without `memories` (default 10 000) a component with
+/// several linear memories could take many times `mem_bytes`. Instances and
+/// tables are likewise capped so a guest cannot spawn thousands of them.
+fn store_limits(mem_bytes: usize) -> wasmtime::StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(mem_bytes)
+        .memories(MAX_MEMORIES)
+        .instances(MAX_INSTANCES)
+        .tables(MAX_TABLES)
+        .table_elements(MAX_TABLE_ELEMENTS)
+        .build()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
