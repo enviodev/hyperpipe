@@ -410,7 +410,10 @@ world sink {
 }
 ```
 
-**Error contract:** a `process`/`write` returning `err` triggers engine retry with backoff (configurable per node, default 3 attempts) → then pipeline enters `degraded` state and pauses that branch (never silently drops). A trapped/OOM'd instance is recycled; the batch retries on a fresh instance.
+**Error contract (current behaviour):**
+
+- **Sinks.** A `write` returning `err` is retried with backoff (3 attempts), then the branch is paused: its cursor freezes, sibling branches keep flowing, and the failure is logged at error level. Nothing acked past the failure is lost; restart resumes from the frozen cursor.
+- **Processors.** A `process` call that returns `err`, traps, or exceeds its memory/epoch limit is logged at error level and **that batch is skipped**; the stage continues with the next batch. A trapped/OOM'd instance is recycled before the next call. Because the source cursor still advances past a skipped batch, its records do not reach any sink. Retrying processor batches (and pausing the branch instead of skipping) is a known gap; see `docs/E2E_TEST_PLAN.md` E2E-15.
 
 ### 6.3 Capability enforcement (security model)
 

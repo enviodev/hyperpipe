@@ -8,7 +8,7 @@
 mod host_impl;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -63,11 +63,17 @@ use host_impl::{proc_bindings, sink_bindings, types_iface, HostState};
 /// Shared reqwest client for guest `host.http` calls. Timeouts are mandatory:
 /// epoch interruption cannot preempt a guest parked inside a host import, so
 /// without them one hung endpoint wedges a worker thread forever.
-fn build_http_client() -> reqwest::Result<reqwest::Client> {
+///
+/// Redirects are never followed. The `permissions.http` allowlist is checked
+/// against the URL the guest asked for; an allowlisted host that answered
+/// with a 3xx to somewhere else would otherwise pull the request onto a host
+/// the module was never granted. The guest sees the 3xx and can decide.
+pub(crate) fn build_http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("hyperpipe/0.1")
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
 }
 
@@ -116,8 +122,104 @@ pub struct Runtime {
     linker: Arc<Linker<HostState>>,
     services: Arc<HostServices>,
     cfg: RuntimeConfig,
+    /// False when the cache directory could not be made private to this
+    /// user; then every load precompiles in memory and nothing is read from
+    /// or written to disk.
+    cache_usable: bool,
     epoch_stop: Arc<AtomicBool>,
     epoch_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+// ---------------------------------------------------------------------------
+// Precompiled-component cache.
+//
+// `Component::deserialize_file` is `unsafe` because a `.cwasm` is native code:
+// whatever is in that file runs in this process with the host's privileges,
+// outside the sandbox. The cache key is the hash of the *input* wasm, so it
+// says nothing about the bytes on disk. The only thing that makes the cache
+// trustworthy is that nobody else can write to it, so that is what is
+// enforced: the directory and every entry must be owned by this user and not
+// writable by anyone else. Entries are written to a temp file with mode 0600
+// and renamed into place, so a reader never sees a half-written artifact.
+// ---------------------------------------------------------------------------
+
+/// Create the cache directory if needed and decide whether it is safe to use.
+fn prepare_cache_dir(dir: &Path) -> bool {
+    if !dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(dir = %dir.display(), "cannot create component cache: {e}; caching disabled");
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    match std::fs::metadata(dir) {
+        Ok(md) if md.is_dir() => {
+            if private_to_this_user(&md) {
+                true
+            } else {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    "component cache is not private to this user (wrong owner or group/other-writable); \
+                     caching disabled — chmod 700 it or set XDG_CACHE_HOME to a private directory"
+                );
+                false
+            }
+        }
+        _ => {
+            tracing::warn!(dir = %dir.display(), "component cache path is not a directory; caching disabled");
+            false
+        }
+    }
+}
+
+/// A cache entry may be handed to `deserialize_file` only if it is a regular
+/// file that this user owns and nobody else can modify.
+fn cache_entry_trusted(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => md.is_file() && private_to_this_user(&md),
+        Err(_) => false,
+    }
+}
+
+#[cfg(unix)]
+fn private_to_this_user(md: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    md.uid() == me && md.mode() & 0o022 == 0
+}
+
+#[cfg(not(unix))]
+fn private_to_this_user(_md: &std::fs::Metadata) -> bool {
+    // No portable ownership/ACL check here; rely on the per-user cache location.
+    true
+}
+
+/// Atomically place `bytes` at `path` with mode 0600.
+fn write_cache_entry(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        use std::io::Write;
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 impl Runtime {
@@ -132,7 +234,7 @@ impl Runtime {
         proc_bindings::envio::hyperpipe::host::add_to_linker(&mut linker, |s: &mut HostState| s)
             .context("link host imports")?;
 
-        std::fs::create_dir_all(&cfg.cache_dir).ok();
+        let cache_usable = prepare_cache_dir(&cfg.cache_dir);
 
         // Epoch ticker: one increment per second drives per-call deadlines.
         let epoch_stop = Arc::new(AtomicBool::new(false));
@@ -153,6 +255,7 @@ impl Runtime {
             linker: Arc::new(linker),
             services,
             cfg,
+            cache_usable,
             epoch_stop,
             epoch_thread,
         })
@@ -165,26 +268,33 @@ impl Runtime {
     fn compile(&self, wasm: &[u8]) -> Result<Component> {
         let key = sha256_hex(wasm);
         let path = self.cfg.cache_dir.join(format!("{key}.cwasm"));
-        if path.exists() {
-            // SAFETY: cache dir is written only by us with matching engine config.
+        if self.cache_usable && cache_entry_trusted(&path) {
+            // SAFETY: the directory and this entry are owned by us and not
+            // writable by anyone else (checked above), and we only ever write
+            // artifacts produced by an engine with this configuration.
+            // wasmtime additionally rejects artifacts from a different
+            // engine/version.
             if let Ok(c) = unsafe { Component::deserialize_file(&self.engine, &path) } {
                 return Ok(c);
             }
+            tracing::warn!(path = %path.display(), "cached component rejected by wasmtime; recompiling");
         }
         let serialized = self
             .engine
             .precompile_component(wasm)
             .context("precompile component")?;
-        std::fs::write(&path, &serialized).ok();
+        if self.cache_usable {
+            if let Err(e) = write_cache_entry(&path, &serialized) {
+                tracing::warn!(path = %path.display(), "could not write component cache entry: {e}");
+            }
+        }
         // SAFETY: freshly produced by this engine.
         let component = unsafe { Component::deserialize(&self.engine, &serialized)? };
         Ok(component)
     }
 
     fn new_store(&self, node: &NodeCtx) -> Store<HostState> {
-        let limits = StoreLimitsBuilder::new()
-            .memory_size(self.cfg.wasm_mem_bytes)
-            .build();
+        let limits = store_limits(self.cfg.wasm_mem_bytes);
         let state = HostState::new(
             node.module_name.clone(),
             node.http_allow.clone(),
@@ -471,7 +581,7 @@ fn new_store_for(
     mem_bytes: usize,
     deadline: u64,
 ) -> Store<HostState> {
-    let limits = StoreLimitsBuilder::new().memory_size(mem_bytes).build();
+    let limits = store_limits(mem_bytes);
     let state = HostState::new(
         node.module_name.clone(),
         node.http_allow.clone(),
@@ -483,6 +593,32 @@ fn new_store_for(
     store.limiter(|s| &mut s.limits);
     store.set_epoch_deadline(deadline);
     store
+}
+
+/// Upper bound on core-module instances, linear memories and tables one
+/// module may create. A component built from a single Rust crate needs one
+/// of each (plus the wasip2 adapter, which imports its memory); a handful is
+/// plenty of headroom, and it puts a hard ceiling on the *total* memory a
+/// guest can claim: `MAX_MEMORIES * wasm_mem_bytes`.
+const MAX_INSTANCES: usize = 8;
+const MAX_MEMORIES: usize = 4;
+const MAX_TABLES: usize = 8;
+/// Function tables grow with the number of indirect-call targets; a guest
+/// asking for millions of elements is not a data pipeline stage.
+const MAX_TABLE_ELEMENTS: usize = 1 << 20;
+
+/// Resource limits for one guest store. `memory_size` is a *per-memory* cap
+/// in wasmtime, so without `memories` (default 10 000) a component with
+/// several linear memories could take many times `mem_bytes`. Instances and
+/// tables are likewise capped so a guest cannot spawn thousands of them.
+fn store_limits(mem_bytes: usize) -> wasmtime::StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(mem_bytes)
+        .memories(MAX_MEMORIES)
+        .instances(MAX_INSTANCES)
+        .tables(MAX_TABLES)
+        .table_elements(MAX_TABLE_ELEMENTS)
+        .build()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -704,6 +840,66 @@ mod tests {
         );
         assert_ne!(sha256_hex(b"abc"), sha256_hex(b"abd"));
         assert_eq!(sha256_hex(b"").len(), 64);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hp-cache-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn prepare_cache_dir_creates_a_private_directory() {
+        let d = scratch("create");
+        assert!(prepare_cache_dir(&d));
+        assert!(d.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_writable_cache_dir_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("shared");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!prepare_cache_dir(&d), "group/other-writable dir must disable the cache");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(prepare_cache_dir(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_entries_must_be_private_regular_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("entries");
+        std::fs::create_dir_all(&d).unwrap();
+
+        let ok = d.join("ok.cwasm");
+        write_cache_entry(&ok, b"native code").unwrap();
+        assert_eq!(std::fs::metadata(&ok).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(cache_entry_trusted(&ok));
+        assert!(!d.join(format!("ok.tmp-{}", std::process::id())).exists(), "temp file renamed away");
+
+        // Someone else could have modified this one.
+        let loose = d.join("loose.cwasm");
+        std::fs::write(&loose, b"x").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(!cache_entry_trusted(&loose));
+
+        // A symlink pointing somewhere we do not control is not a cache entry.
+        let link = d.join("link.cwasm");
+        std::os::unix::fs::symlink(&ok, &link).unwrap();
+        assert!(!cache_entry_trusted(&link));
+
+        assert!(!cache_entry_trusted(&d.join("missing.cwasm")));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

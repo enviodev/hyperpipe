@@ -1,5 +1,10 @@
 # HyperPipe
 
+> **Beta.** HyperPipe is under active development. The YAML schema, the module
+> contract (`wit/hyperpipe.wit`) and the CLI may change between releases without
+> a compatibility guarantee. It is a self-hosted tool; there is currently no
+> commitment to offer it as a hosted service on Envio's cloud.
+
 WASM data pipelines on **Envio HyperSync**: self-hosted, one binary, one YAML file.
 One YAML file declares chains (sources), an ordered DAG of WASM processors (ABI decode,
 filter, custom), and one or more WASM sinks. The engine streams data through, sandboxes
@@ -108,3 +113,16 @@ N rows (deterministic keys); kill -9 mid-backfill with exact-once row counts.
 
 Current limitations: chains are those HyperSync serves (EVM + Fuel; no Solana), and there are
 no SQL transforms. See ARCHITECTURE.md §1.2 and §12 for what is not implemented yet.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](./LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](./LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions.

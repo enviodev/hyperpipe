@@ -702,3 +702,16 @@ fn load_from_a_file_path() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn err_secret_in_a_typed_field_never_echoes_the_value() {
+    // A `${secret:..}` ref in a field that is not a plain string fails the
+    // shape check *before* resolution, so the serde message quotes the
+    // reference, never the resolved value.
+    let s = GOOD.replace("resource_size: m", "resource_size: ${secret:SZ}");
+    let err = Config::load_str(&s, &secrets(&[("SZ", "topsecretvalue")])).unwrap_err();
+    assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+    let msg = err.to_string();
+    assert!(!msg.contains("topsecretvalue"), "secret value leaked into: {msg}");
+    assert!(msg.contains("${secret:SZ}"), "expected the reference in: {msg}");
+}
