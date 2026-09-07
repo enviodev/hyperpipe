@@ -156,9 +156,9 @@ macro_rules! export_processor {
                 path: "../../wit",
                 pub_export_macro: true,
             });
-            // Batch / InitCtx / Output are already re-exported at the world root
-            // by `use types.{...}`; only Encoding needs lifting.
-            pub use self::envio::hyperpipe::types::Encoding;
+            // The exported interface re-uses the shared `types`; lift them to
+            // the bindings root so the glue below reads the same for both worlds.
+            pub use self::envio::hyperpipe::types::{Batch, Encoding, InitCtx, Output};
 
             // Typed host-import wrappers for module code. Only linked into the
             // component if actually used (wit-bindgen tree-shakes imports).
@@ -232,7 +232,7 @@ macro_rules! export_processor {
             }
         }
 
-        impl __hp_bindings::Guest for __HpComponent {
+        impl __hp_bindings::exports::envio::hyperpipe::processor_impl::Guest for __HpComponent {
             fn init(
                 ctx: __hp_bindings::InitCtx,
             ) -> ::core::result::Result<(), ::std::string::String> {
@@ -292,7 +292,7 @@ macro_rules! export_sink {
                 path: "../../wit",
                 pub_export_macro: true,
             });
-            pub use self::envio::hyperpipe::types::Encoding;
+            pub use self::envio::hyperpipe::types::{Batch, Encoding, InitCtx};
 
             // Typed host-import wrappers for module code. Only linked into the
             // component if actually used (wit-bindgen tree-shakes imports).
@@ -366,7 +366,7 @@ macro_rules! export_sink {
             }
         }
 
-        impl __hp_bindings::Guest for __HpComponent {
+        impl __hp_bindings::exports::envio::hyperpipe::sink_impl::Guest for __HpComponent {
             fn init(
                 ctx: __hp_bindings::InitCtx,
             ) -> ::core::result::Result<(), ::std::string::String> {

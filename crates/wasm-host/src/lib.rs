@@ -232,7 +232,7 @@ impl Runtime {
         let ctx = init_ctx(node);
         store.set_epoch_deadline(self.cfg.epoch_deadline_secs);
         bindings
-            .call_init(&mut store, &ctx)
+            .envio_hyperpipe_processor_impl().call_init(&mut store, &ctx)
             .context("call init")?
             .map_err(|e| anyhow::anyhow!("module init: {e}"))?;
         Ok(ProcSlot { store, bindings })
@@ -267,7 +267,7 @@ impl Runtime {
         let ctx = init_ctx(node);
         store.set_epoch_deadline(self.cfg.epoch_deadline_secs);
         bindings
-            .call_init(&mut store, &ctx)
+            .envio_hyperpipe_sink_impl().call_init(&mut store, &ctx)
             .context("call init")?
             .map_err(|e| anyhow::anyhow!("module init: {e}"))?;
         Ok(SinkSlot { store, bindings })
@@ -344,7 +344,7 @@ impl WasmProcessor {
         // A trap poisons the store: drop the slot (checkout builds a fresh one
         // later). A graceful module Err leaves a perfectly reusable instance —
         // return it to the pool, or its internal state would be lost.
-        let call = match slot.bindings.call_process(&mut slot.store, &wire) {
+        let call = match slot.bindings.envio_hyperpipe_processor_impl().call_process(&mut slot.store, &wire) {
             Ok(c) => c,
             Err(trap) => return Err(trap).context("call process"),
         };
@@ -378,7 +378,7 @@ impl WasmProcessor {
                 .context("instantiate processor")?;
         let ctx = init_ctx(&self.node);
         bindings
-            .call_init(&mut store, &ctx)
+            .envio_hyperpipe_processor_impl().call_init(&mut store, &ctx)
             .context("call init")?
             .map_err(|e| anyhow::anyhow!("module init: {e}"))?;
         Ok(ProcSlot { store, bindings })
@@ -420,7 +420,7 @@ impl WasmSink {
         // Trap -> drop the poisoned slot. Graceful Err -> KEEP the instance:
         // a buffering sink (e.g. s3) holds not-yet-flushed rows in its state,
         // and discarding it on a retryable write error would silently lose them.
-        let call = match slot.bindings.call_write(&mut slot.store, &wire) {
+        let call = match slot.bindings.envio_hyperpipe_sink_impl().call_write(&mut slot.store, &wire) {
             Ok(c) => c,
             Err(trap) => return Err(trap).context("call write"),
         };
@@ -434,7 +434,7 @@ impl WasmSink {
         for slot in pool.iter_mut() {
             slot.store.set_epoch_deadline(self.deadline);
             slot.bindings
-                .call_flush(&mut slot.store)
+                .envio_hyperpipe_sink_impl().call_flush(&mut slot.store)
                 .context("call flush")?
                 .map_err(|e| anyhow::anyhow!("module flush error: {e}"))?;
         }
@@ -457,7 +457,7 @@ impl WasmSink {
                 .context("instantiate sink")?;
         let ctx = init_ctx(&self.node);
         bindings
-            .call_init(&mut store, &ctx)
+            .envio_hyperpipe_sink_impl().call_init(&mut store, &ctx)
             .context("call init")?
             .map_err(|e| anyhow::anyhow!("module init: {e}"))?;
         Ok(SinkSlot { store, bindings })

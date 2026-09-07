@@ -10,6 +10,9 @@ mod wasm_glue {
         path: "../../wit",
     });
 
+    use envio::hyperpipe::types::{Batch, InitCtx};
+    use exports::envio::hyperpipe::sink_impl::Guest;
+
     struct Component;
 
     impl Guest for Component {

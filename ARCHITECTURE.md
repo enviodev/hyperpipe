@@ -393,24 +393,39 @@ interface host {
 }
 
 /// ---- Processor modules ----
-world processor {
-  import host;
+///
+/// Exports live in named interfaces rather than at world level on purpose:
+/// a world-level `export write` produces a core-module symbol called `write`,
+/// which shadows wasi-libc's `write(2)` at link time. Any guest that then
+/// prints (the stdout sink, a panic message) calls its own export instead and
+/// corrupts its heap. Interface exports are namespaced
+/// (`envio:hyperpipe/sink-impl#write`) and cannot collide.
+interface processor-impl {
   use types.{init-ctx, batch, output};
 
-  export init: func(ctx: init-ctx) -> result<_, string>;
-  export process: func(input: batch) -> result<output, string>;
+  init: func(ctx: init-ctx) -> result<_, string>;
+  process: func(input: batch) -> result<output, string>;
+}
+
+world processor {
+  import host;
+  export processor-impl;
 }
 
 /// ---- Sink modules ----
-world sink {
-  import host;
+interface sink-impl {
   use types.{init-ctx, batch};
 
-  export init: func(ctx: init-ctx) -> result<_, string>;
+  init: func(ctx: init-ctx) -> result<_, string>;
   /// Returning ok = durable-enough to ack (engine may then advance cursor past this batch).
-  export write: func(input: batch) -> result<_, string>;
+  write: func(input: batch) -> result<_, string>;
   /// Called on graceful shutdown and before checkpoint barriers. Must push any buffered data.
-  export flush: func() -> result<_, string>;
+  flush: func() -> result<_, string>;
+}
+
+world sink {
+  import host;
+  export sink-impl;
 }
 ```
 
