@@ -76,8 +76,8 @@ only costs replayed (deduped) work, never lost data.
 - A status line per source every 5 s: total records, rec/s, batch count, uptime.
 - Sink failures: 2 warn-level retries, then an error and **branch pause** (cursor freezes —
   restart the process after fixing the sink; nothing is lost).
-- Module `metric_add` counters are collected in-process; a Prometheus `/metrics` endpoint is
-  phase 1.
+- Module `metric_add` counters are collected in-process; there is no Prometheus `/metrics`
+  endpoint yet.
 
 ## Troubleshooting
 

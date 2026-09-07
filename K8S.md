@@ -73,9 +73,9 @@ A single pipeline is **one writer** — its SQLite checkpoint cannot be shared. 
   more WASM instances per stage, bigger channels). Set container `resources` to match:
   `l` wants ~2 CPU / 1Gi.
 
-For shared/HA checkpoint state (multiple readers, failover), the roadmap adds a
-Postgres checkpoint backend (`checkpoint.store: postgres`) — then the PVC is no
-longer the single point of state.
+For shared/HA checkpoint state (multiple readers, failover), a Postgres checkpoint
+backend (`checkpoint.store: postgres`) is reserved in the schema but not implemented
+yet; until then the PVC is the single point of state.
 
 ## Storage
 

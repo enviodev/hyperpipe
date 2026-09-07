@@ -5,7 +5,7 @@
 > a compatibility guarantee. It is a self-hosted tool; there is currently no
 > commitment to offer it as a hosted service on Envio's cloud.
 
-WASM data pipelines on **Envio HyperSync** — a self-hosted alternative to Goldsky Turbo.
+WASM data pipelines on **Envio HyperSync**: self-hosted, one binary, one YAML file.
 One YAML file declares chains (sources), an ordered DAG of WASM processors (ABI decode,
 filter, custom), and one or more WASM sinks. The engine streams data through, sandboxes
 every module, and recovers with at-least-once delivery.
@@ -13,8 +13,8 @@ every module, and recovers with at-least-once delivery.
 **📚 Full documentation: [docs/](./docs/README.md)** — getting started, YAML reference, module
 reference + authoring, codebase guide, deployment (binary/Docker/K8s), operations.
 
-See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the full design and **[ACTION_PLAN.md](./ACTION_PLAN.md)**
-for the milestone plan. Section refs (§) point at ARCHITECTURE.md.
+See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the full design. Section refs (§) point at
+ARCHITECTURE.md.
 
 ```
 hyperpipe run pipeline.yaml
@@ -85,35 +85,34 @@ cargo test                            # native: encoding, config, source, host i
 The host integration test loads the real decoder + stdout components and runs a batch
 through wasmtime; it soft-skips if the wasm artifacts aren't built.
 
-## Status (hackathon build)
+## Status
 
 Working end-to-end today — **`hyperpipe run` streams HyperSync → WASM ABI decode → WASM
 filter/enrich → sink(s)**, multi-chain, with fan-out, backpressure, module sandboxing
 (capability-gated host imports), epoch/memory limits, precompiled-component cache, and
 at-least-once crash recovery. See [DEMO.md](./DEMO.md).
 
-| Milestone | State |
+| Feature | State |
 |---|---|
-| M0 scaffold, WIT contract | ✅ |
-| M1 config parse + validation (19 tests) | ✅ |
-| M2 HyperSync source loop (live/backfill/both, EOF) | ✅ |
-| M3 DAG runtime (channels, fan-out, backpressure, status) | ✅ |
-| M4 WASM host (wasmtime, imports, pools, limits, cwasm) | ✅ |
-| M5 guest SDK (Processor/Sink traits + macros + host wrappers) | ✅ |
-| M6 evm-abi-decoder (4 golden tests) | ✅ |
-| M7 SQLite checkpointing + crash recovery | ✅ `crash-test.sh`: 300/300, 0 gaps, 15× kill -9 |
+| WIT module contract | ✅ |
+| Config parse + validation | ✅ |
+| HyperSync source loop (live/backfill/both, EOF) | ✅ |
+| DAG runtime (channels, fan-out, backpressure, status) | ✅ |
+| WASM host (wasmtime, imports, pools, limits, cwasm) | ✅ |
+| Guest SDK (Processor/Sink traits + macros + host wrappers) | ✅ |
+| evm-abi-decoder (golden tests) | ✅ |
+| SQLite checkpointing + crash recovery | ✅ `crash-test.sh`: 300/300, 0 gaps, 15× kill -9 |
 | Reorg handling: rollback_guard tracking → rollback control → sink invalidation + cursor rewind | ✅ `reorg-test.sh`: 120/120 rows, 65 forked rows replaced, 0 stale |
-| M9 sinks: stdout, blackhole, postgres, webhook, **s3 (Parquet)** | ✅ verified vs real pg / webhook / Parquet file |
-| M11 filter builtin (4 tests) + out-of-tree `enrich` example | ✅ |
-| host imports: log, metric, kv, http, sql-exec/batch, **blob-put** | ✅ (kafka = phase 1) |
-| M12 benchmark vs Turbo | ⏳ (not run this pass) |
+| Sinks: stdout, blackhole, postgres, webhook, **s3 (Parquet)** | ✅ verified vs real pg / webhook / Parquet file |
+| filter builtin + out-of-tree `enrich` example | ✅ |
+| Host imports: log, metric, kv, http, sql-exec/batch, **blob-put** | ✅ (kafka: not yet) |
 
 Verified end-to-end (mock HyperSync + real backends): decode → Postgres upsert with auto-DDL;
 decode → webhook POST (capability-gated, denial path tested); decode → S3 Parquet flush after
 N rows (deterministic keys); kill -9 mid-backfill with exact-once row counts.
 
-Known gaps vs Turbo (by design): EVM + Fuel only (no Solana), no SQL transforms yet
-(DataFusion is the phase-3 plan). See ARCHITECTURE.md §1.2.
+Current limitations: chains are those HyperSync serves (EVM + Fuel; no Solana), and there are
+no SQL transforms. See ARCHITECTURE.md §1.2 and §12 for what is not implemented yet.
 
 ## License
 
