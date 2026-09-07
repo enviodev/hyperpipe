@@ -1,5 +1,10 @@
 # HyperPipe
 
+> **Beta.** HyperPipe is under active development. The YAML schema, the module
+> contract (`wit/hyperpipe.wit`) and the CLI may change between releases without
+> a compatibility guarantee. It is a self-hosted tool; there is currently no
+> commitment to offer it as a hosted service on Envio's cloud.
+
 WASM data pipelines on **Envio HyperSync** — a self-hosted alternative to Goldsky Turbo.
 One YAML file declares chains (sources), an ordered DAG of WASM processors (ABI decode,
 filter, custom), and one or more WASM sinks. The engine streams data through, sandboxes
