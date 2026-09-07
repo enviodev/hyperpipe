@@ -63,11 +63,17 @@ use host_impl::{proc_bindings, sink_bindings, types_iface, HostState};
 /// Shared reqwest client for guest `host.http` calls. Timeouts are mandatory:
 /// epoch interruption cannot preempt a guest parked inside a host import, so
 /// without them one hung endpoint wedges a worker thread forever.
-fn build_http_client() -> reqwest::Result<reqwest::Client> {
+///
+/// Redirects are never followed. The `permissions.http` allowlist is checked
+/// against the URL the guest asked for; an allowlisted host that answered
+/// with a 3xx to somewhere else would otherwise pull the request onto a host
+/// the module was never granted. The guest sees the 3xx and can decide.
+pub(crate) fn build_http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("hyperpipe/0.1")
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
 }
 
