@@ -125,12 +125,12 @@ impl Runtime {
         let mut wc = wasmtime::Config::new();
         wc.wasm_component_model(true);
         wc.epoch_interruption(true);
-        let engine = Engine::new(&wc).context("create wasmtime engine")?;
+        let engine = Engine::new(&wc).wt_context("create wasmtime engine")?;
 
         let mut linker: Linker<HostState> = Linker::new(&engine);
-        wasmtime_wasi::add_to_linker_sync(&mut linker).context("link wasi")?;
-        proc_bindings::envio::hyperpipe::host::add_to_linker(&mut linker, |s: &mut HostState| s)
-            .context("link host imports")?;
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker).wt_context("link wasi")?;
+        proc_bindings::envio::hyperpipe::host::add_to_linker::<_, wasmtime::component::HasSelf<_>>(&mut linker, |s: &mut HostState| s)
+            .wt_context("link host imports")?;
 
         std::fs::create_dir_all(&cfg.cache_dir).ok();
 
@@ -174,7 +174,7 @@ impl Runtime {
         let serialized = self
             .engine
             .precompile_component(wasm)
-            .context("precompile component")?;
+            .wt_context("precompile component")?;
         std::fs::write(&path, &serialized).ok();
         // SAFETY: freshly produced by this engine.
         let component = unsafe { Component::deserialize(&self.engine, &serialized)? };
@@ -228,12 +228,12 @@ impl Runtime {
     ) -> Result<ProcSlot> {
         let mut store = self.new_store(node);
         let bindings = proc_bindings::Processor::instantiate(&mut store, component, &self.linker)
-            .context("instantiate processor")?;
+            .wt_context("instantiate processor")?;
         let ctx = init_ctx(node);
         store.set_epoch_deadline(self.cfg.epoch_deadline_secs);
         bindings
             .call_init(&mut store, &ctx)
-            .context("call init")?
+            .wt_context("call init")?
             .map_err(|e| anyhow::anyhow!("module init: {e}"))?;
         Ok(ProcSlot { store, bindings })
     }
@@ -263,12 +263,12 @@ impl Runtime {
     fn instantiate_sink(&self, component: &Component, node: &NodeCtx) -> Result<SinkSlot> {
         let mut store = self.new_store(node);
         let bindings = sink_bindings::Sink::instantiate(&mut store, component, &self.linker)
-            .context("instantiate sink")?;
+            .wt_context("instantiate sink")?;
         let ctx = init_ctx(node);
         store.set_epoch_deadline(self.cfg.epoch_deadline_secs);
         bindings
             .call_init(&mut store, &ctx)
-            .context("call init")?
+            .wt_context("call init")?
             .map_err(|e| anyhow::anyhow!("module init: {e}"))?;
         Ok(SinkSlot { store, bindings })
     }
@@ -346,7 +346,7 @@ impl WasmProcessor {
         // return it to the pool, or its internal state would be lost.
         let call = match slot.bindings.call_process(&mut slot.store, &wire) {
             Ok(c) => c,
-            Err(trap) => return Err(trap).context("call process"),
+            Err(trap) => return Err(trap).wt_context("call process"),
         };
         self.inner.pool.lock().unwrap().push(slot);
         match call {
@@ -375,11 +375,11 @@ impl WasmProcessor {
         );
         let bindings =
             proc_bindings::Processor::instantiate(&mut store, &self.component, &self.inner.linker)
-                .context("instantiate processor")?;
+                .wt_context("instantiate processor")?;
         let ctx = init_ctx(&self.node);
         bindings
             .call_init(&mut store, &ctx)
-            .context("call init")?
+            .wt_context("call init")?
             .map_err(|e| anyhow::anyhow!("module init: {e}"))?;
         Ok(ProcSlot { store, bindings })
     }
@@ -422,7 +422,7 @@ impl WasmSink {
         // and discarding it on a retryable write error would silently lose them.
         let call = match slot.bindings.call_write(&mut slot.store, &wire) {
             Ok(c) => c,
-            Err(trap) => return Err(trap).context("call write"),
+            Err(trap) => return Err(trap).wt_context("call write"),
         };
         self.inner.pool.lock().unwrap().push(slot);
         call.map_err(|msg| anyhow::anyhow!("module write error: {msg}"))
@@ -435,7 +435,7 @@ impl WasmSink {
             slot.store.set_epoch_deadline(self.deadline);
             slot.bindings
                 .call_flush(&mut slot.store)
-                .context("call flush")?
+                .wt_context("call flush")?
                 .map_err(|e| anyhow::anyhow!("module flush error: {e}"))?;
         }
         Ok(())
@@ -454,11 +454,11 @@ impl WasmSink {
         );
         let bindings =
             sink_bindings::Sink::instantiate(&mut store, &self.component, &self.inner.linker)
-                .context("instantiate sink")?;
+                .wt_context("instantiate sink")?;
         let ctx = init_ctx(&self.node);
         bindings
             .call_init(&mut store, &ctx)
-            .context("call init")?
+            .wt_context("call init")?
             .map_err(|e| anyhow::anyhow!("module init: {e}"))?;
         Ok(SinkSlot { store, bindings })
     }
@@ -483,6 +483,18 @@ fn new_store_for(
     store.limiter(|s| &mut s.limits);
     store.set_epoch_deadline(deadline);
     store
+}
+
+/// wasmtime ships its own `Error` type (not `std::error::Error`), so anyhow's
+/// `.context()` does not apply to it directly. Convert first, then attach.
+trait WtContext<T> {
+    fn wt_context(self, msg: &'static str) -> Result<T>;
+}
+
+impl<T> WtContext<T> for std::result::Result<T, wasmtime::Error> {
+    fn wt_context(self, msg: &'static str) -> Result<T> {
+        self.map_err(anyhow::Error::from).context(msg)
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
