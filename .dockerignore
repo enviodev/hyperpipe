@@ -3,10 +3,21 @@ target
 .git
 .gitignore
 state
+**/state
 *.db
 *.db-shm
 *.db-wal
-.env
-pipeline.env
 *.cwasm
 /dist
+
+# Secrets must never enter the build context: .dockerignore patterns match
+# at the context root only, so `.env` alone left examples/pipeline.env and
+# deploy/hyperpipe.env inside `COPY . .`.
+.env
+.env.*
+*.env
+**/.env
+**/.env.*
+**/*.env
+**/pipeline.env
+deploy/pipeline.yaml
