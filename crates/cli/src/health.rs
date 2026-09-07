@@ -3,11 +3,21 @@
 //! Enabled by setting `HYPERPIPE_HEALTH_PORT`. Endpoints:
 //!   GET /healthz  -> 200 while alive, 503 once shutting down   (livenessProbe)
 //!   GET /readyz   -> 200 once running,  503 while starting      (readinessProbe)
+//!
+//! Binds `0.0.0.0` by default so kubelet / compose probes can reach it from
+//! outside the container; set `HYPERPIPE_HEALTH_BIND=127.0.0.1` (or any
+//! address) to restrict it. Each connection gets one bounded read with a
+//! deadline, so a peer that connects and never sends cannot pin a task.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+/// Where the listener binds unless `HYPERPIPE_HEALTH_BIND` says otherwise.
+const DEFAULT_BIND: &str = "0.0.0.0";
+/// A probe request is a few dozen bytes; anything slower than this is not one.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub const STARTING: u8 = 0;
 pub const RUNNING: u8 = 1;
@@ -32,16 +42,17 @@ pub fn maybe_spawn() -> Option<tokio::task::JoinHandle<()>> {
             return None;
         }
     };
+    let bind = std::env::var("HYPERPIPE_HEALTH_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     Some(tokio::spawn(async move {
-        if let Err(e) = serve(port).await {
+        if let Err(e) = serve(&bind, port).await {
             tracing::warn!("health server stopped: {e}");
         }
     }))
 }
 
-async fn serve(port: u16) -> std::io::Result<()> {
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    tracing::info!(port, "health server listening (/healthz, /readyz)");
+async fn serve(bind: &str, port: u16) -> std::io::Result<()> {
+    let listener = TcpListener::bind((bind, port)).await?;
+    tracing::info!(bind, port, "health server listening (/healthz, /readyz)");
     loop {
         // Transient accept errors (e.g. EMFILE under fd pressure) must not
         // kill the probe endpoints for the rest of the pod's life.
@@ -55,7 +66,12 @@ async fn serve(port: u16) -> std::io::Result<()> {
         };
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
+            // One bounded read under a deadline: a peer that connects and
+            // stays silent is dropped instead of holding a task forever.
+            let n = match tokio::time::timeout(READ_TIMEOUT, sock.read(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) | Err(_) => return,
+            };
             let req = String::from_utf8_lossy(&buf[..n]);
             let path = req.split_whitespace().nth(1).unwrap_or("/");
             let state = STATE.load(Ordering::Relaxed);
@@ -99,7 +115,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener); // free it for serve() to take (racy in theory, fine here)
         tokio::spawn(async move {
-            let _ = serve(port).await;
+            let _ = serve("127.0.0.1", port).await;
         });
         // Wait for the listener to come up rather than sleeping blind.
         for _ in 0..100 {
@@ -127,6 +143,55 @@ mod tests {
             .unwrap_or(0);
         let body = resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
         (code, body)
+    }
+
+    #[tokio::test]
+    async fn a_silent_client_is_dropped_after_the_read_timeout() {
+        let _g = LOCK.lock().unwrap();
+        let port = spawn_server().await;
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+        // Send nothing. The server must close on us within the deadline
+        // rather than wait for a request that never comes.
+        let mut buf = [0u8; 16];
+        let started = std::time::Instant::now();
+        let closed = tokio::time::timeout(READ_TIMEOUT * 3, sock.read(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "expected the server to hang up, got {closed:?}"
+        );
+        assert!(started.elapsed() < READ_TIMEOUT * 3, "hang-up must come from the deadline");
+        // And the server is still serving afterwards.
+        set_state(RUNNING);
+        assert_eq!(get(port, "/readyz").await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn bind_address_comes_from_env() {
+        let _g = LOCK.lock().unwrap();
+        let (saved_port, saved_bind) =
+            (std::env::var_os("HYPERPIPE_HEALTH_PORT"), std::env::var_os("HYPERPIPE_HEALTH_BIND"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        std::env::set_var("HYPERPIPE_HEALTH_PORT", port.to_string());
+        std::env::set_var("HYPERPIPE_HEALTH_BIND", "127.0.0.1");
+        let handle = maybe_spawn().expect("spawned");
+        for _ in 0..100 {
+            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(get(port, "/healthz").await.0, 200);
+        handle.abort();
+        match saved_port {
+            Some(v) => std::env::set_var("HYPERPIPE_HEALTH_PORT", v),
+            None => std::env::remove_var("HYPERPIPE_HEALTH_PORT"),
+        }
+        match saved_bind {
+            Some(v) => std::env::set_var("HYPERPIPE_HEALTH_BIND", v),
+            None => std::env::remove_var("HYPERPIPE_HEALTH_BIND"),
+        }
     }
 
     #[tokio::test]
