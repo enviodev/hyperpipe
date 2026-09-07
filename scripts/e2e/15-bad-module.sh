@@ -119,8 +119,6 @@ pass "trap recycled and the run reached EOF (a: $delivered/$BLOCKS records, $los
 # NOTE — the records lost in (a) are real and not asserted on purpose.
 # `processor_task` logs a failed batch and moves on, so the trapped batch's
 # records never reach the sink while the cursor still advances past them.
-# TEST_PLAN §5.6 specifies exactly that ("process error -> batch dropped, task
-# continues"); ARCHITECTURE.md §13 promises the opposite ("the batch retries on
-# a fresh instance", "never silently drops"). Same class of bug as the fan-out
-# one, but the fix depends on which doc is right, so this scenario reports the
-# loss instead of encoding either answer.
+# TEST_PLAN §5.6, ARCHITECTURE.md §6.2 and docs/modules.md all describe this
+# skip-on-error behaviour as a known gap; this scenario reports the loss so the
+# number stays visible until processor batches are retried like sink batches.

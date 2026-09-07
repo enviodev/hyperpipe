@@ -32,11 +32,11 @@ processor that misbehaves on config command; batches it passes carry a
 `chaos_calls` counter, which is how a test distinguishes a fresh instance
 (counter restarts at 1) from a reused one — no host-side bookkeeping needed.
 
-**Open question §5.6 raises:** the spec here says "`processor_task` process error
-→ batch dropped, task continues", and the code agrees. ARCHITECTURE.md §13 says a
-failed `process` retries ×3 then pauses the branch and "never silently drops".
-E2E-15 shows the current behaviour losing 30 of 100 records behind an advancing
-cursor and a 0 exit. One of the two docs needs to change, and possibly the code.
+**Known gap §5.6 documents:** "`processor_task` process error → batch dropped,
+task continues" is what the code does, and ARCHITECTURE.md §6.2 and
+docs/modules.md now describe exactly that. E2E-15 measures it (30 of 100
+records lost behind an advancing cursor, exit 0). Retrying processor batches
+and pausing the branch, as sinks already do, is the intended improvement.
 
 ---
 
