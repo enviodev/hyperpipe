@@ -1184,6 +1184,7 @@ dependencies = [
  "hp-encoding",
  "hp-engine",
  "hp-testutil",
+ "libc",
  "object_store",
  "reqwest",
  "serde",
