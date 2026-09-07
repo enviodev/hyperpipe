@@ -160,12 +160,20 @@ impl WasiView for HostState {
     }
 }
 
+/// The host reqwest will actually connect to for `url`, or `None` if the URL
+/// is not a well-formed `http`/`https` URL with a host.
+///
+/// This must use the same parser as the client that sends the request. A
+/// hand-rolled split on `/` and `@` disagreed with the WHATWG rules reqwest
+/// follows: `https://evil.com?@allowed.com/` ends the authority at `?`, so
+/// the naive parser reported `allowed.com` while the connection went to
+/// `evil.com`. Anything that is not plain http(s) is denied outright.
 fn url_host(url: &str) -> Option<String> {
-    // avoid a url crate dependency: scheme://host[:port]/...
-    let after = url.split("://").nth(1)?;
-    let authority = after.split('/').next()?;
-    let host = authority.split('@').last()?; // strip userinfo
-    let host = host.split(':').next()?; // strip port
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
     if host.is_empty() {
         None
     } else {
@@ -385,6 +393,34 @@ mod tests {
         assert_eq!(url_host("not-a-url"), None);
         assert_eq!(url_host("https://"), None);
         assert_eq!(url_host(""), None);
+    }
+
+    #[test]
+    fn url_host_rejects_non_http_schemes() {
+        assert_eq!(url_host("ftp://api.example.com/x"), None);
+        assert_eq!(url_host("file:///etc/passwd"), None);
+        assert_eq!(url_host("gopher://api.example.com/"), None);
+    }
+
+    #[test]
+    fn url_host_matches_what_the_client_connects_to() {
+        // Authority ends at `?`, `#` or `\` under WHATWG rules. A parser that
+        // only looked for `/` and then took the text after the last `@` saw
+        // `allowed.com` here while reqwest connected to `evil.com`.
+        for url in [
+            "https://evil.com?@allowed.com/",
+            "https://evil.com#@allowed.com/",
+            "https://evil.com\\@allowed.com/",
+            "https://evil.com:443?x=@allowed.com/",
+        ] {
+            assert_eq!(url_host(url).as_deref(), Some("evil.com"), "{url}");
+            assert!(!host_allowed_by(&allow(&["allowed.com"]), url), "{url}");
+        }
+        // Real userinfo is still stripped.
+        assert_eq!(url_host("https://user:pw@allowed.com/x").as_deref(), Some("allowed.com"));
+        // IP literals and ports are handled by the same parser.
+        assert_eq!(url_host("http://169.254.169.254/latest").as_deref(), Some("169.254.169.254"));
+        assert_eq!(url_host("http://[::1]:8080/").as_deref(), Some("[::1]"));
     }
 
     #[test]
