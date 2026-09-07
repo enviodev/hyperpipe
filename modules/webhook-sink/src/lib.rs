@@ -5,7 +5,7 @@ mod body;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_glue {
-    use crate::body::ndjson;
+    use crate::body::{ndjson, redact_url};
     use hyperpipe_sdk::serde_json::{self, Value};
     use hyperpipe_sdk::{export_sink, Batch, ControlRecord, InitInfo, Sink};
 
@@ -42,7 +42,7 @@ mod wasm_glue {
                 let (status, _resp) =
                     hp_host::http("POST", &self.url, &self.headers, Some(payload))?;
                 if !(200..300).contains(&status) {
-                    return Err(format!("webhook POST {} -> HTTP {status}", self.url));
+                    return Err(format!("webhook POST {} -> HTTP {status}", redact_url(&self.url)));
                 }
                 hp_host::metric_add("webhook.posted", chunk.len() as u64);
             }
@@ -64,7 +64,10 @@ mod wasm_glue {
             payload.push(b'\n');
             let (status, _resp) = hp_host::http("POST", &self.url, &self.headers, Some(payload))?;
             if !(200..300).contains(&status) {
-                return Err(format!("webhook rollback POST {} -> HTTP {status}", self.url));
+                return Err(format!(
+                    "webhook rollback POST {} -> HTTP {status}",
+                    redact_url(&self.url)
+                ));
             }
             Ok(())
         }

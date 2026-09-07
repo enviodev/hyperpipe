@@ -5,7 +5,8 @@
 #
 # Usage: ./scripts/crash-test.sh
 #   PG_CONTAINER / PG_DSN / PG_USER / PG_DB override the postgres target
-#   (same knobs as reorg-test.sh; scripts/e2e/03 passes its own).
+#   (same knobs as reorg-test.sh; scripts/e2e/03 passes its own). WORK overrides
+#   the scratch directory (default: a fresh mktemp -d).
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,8 +32,12 @@ docker exec "$PG_CONTAINER" pg_isready -U "$PG_USER" >/dev/null 2>&1 || {
 BIN="$ROOT/target/debug/hyperpipe"
 [ -x "$BIN" ] || { echo "build first: cargo build"; exit 1; }
 
-WORK=/tmp/hpcrash
-rm -rf "$WORK"; mkdir -p "$WORK"
+# Private scratch dir: the pipeline YAML written here carries the Postgres
+# DSN, so it must not live at a fixed, world-writable path. Callers that want
+# to inspect the checkpoint afterwards (scripts/e2e/03) pass WORK themselves.
+WORK="${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/hpcrash.XXXXXX")}"
+mkdir -p "$WORK"
+echo "workdir: $WORK"
 cp "$ROOT/examples/abis/erc20.json" "$WORK/erc20.json"
 docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -c "DROP TABLE IF EXISTS crash_test;" >/dev/null
 

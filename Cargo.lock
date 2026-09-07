@@ -1278,6 +1278,7 @@ dependencies = [
  "hp-encoding",
  "hp-engine",
  "hp-testutil",
+ "libc",
  "object_store",
  "reqwest 0.12.28",
  "serde",
@@ -1287,6 +1288,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "url",
  "wasmtime",
  "wasmtime-wasi",
 ]

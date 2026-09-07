@@ -21,7 +21,6 @@ sandboxes every module, and recovers with at-least-once delivery.
 
 - [`ARCHITECTURE.md`](../ARCHITECTURE.md) — the full system design and rationale. Section refs
   (§) throughout the code and docs point here.
-- [`ACTION_PLAN.md`](../ACTION_PLAN.md) — milestone plan + current status.
 - [`DEMO.md`](../DEMO.md) — scripted end-to-end demo (works offline, no API token).
 - [`K8S.md`](../K8S.md) — Kubernetes deployment (StatefulSet, probes, scaling model).
 

@@ -21,6 +21,7 @@ SIGINT/SIGTERM drain. Validation failures exit 1 with the offending YAML path in
 | `HYPERPIPE_SECRET_<NAME>` | config loader | Resolves `${secret:NAME}` in the YAML. |
 | `HYPERPIPE_MODULE_DIR` | module loader | Directory containing builtin `.wasm` components. Default `modules/target/wasm32-wasip2/debug`; preset to `/opt/hyperpipe/modules` in the Docker image. |
 | `HYPERPIPE_HEALTH_PORT` | health server | Enables `GET /healthz` + `/readyz` on this port. Unset = no health server. |
+| `HYPERPIPE_HEALTH_BIND` | health server | Address to bind (default `0.0.0.0` so container probes can reach it). Set `127.0.0.1` to keep it local. |
 | `RUST_LOG` | logging | e.g. `hyperpipe=info`, `hyperpipe=debug,hp_wasm_host=debug`. |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION` | s3 connections | Credentials for real S3/R2/MinIO (`local_path` needs none). |
 | `HYPERPIPE_PROFILE`, `HYPERPIPE_MODULE_PROFILE`, `HYPERPIPE_REBUILD` | `scripts/run.sh` only | Launcher build knobs. |
@@ -75,8 +76,8 @@ only costs replayed (deduped) work, never lost data.
 - A status line per source every 5 s: total records, rec/s, batch count, uptime.
 - Sink failures: 2 warn-level retries, then an error and **branch pause** (cursor freezes —
   restart the process after fixing the sink; nothing is lost).
-- Module `metric_add` counters are collected in-process; a Prometheus `/metrics` endpoint is
-  phase 1.
+- Module `metric_add` counters are collected in-process; there is no Prometheus `/metrics`
+  endpoint yet.
 
 ## Troubleshooting
 

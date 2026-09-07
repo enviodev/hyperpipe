@@ -27,8 +27,10 @@ What the suite caught:
   `pipeline.rs::fan_out`.
 - **E2E-15**: a trapping processor loses its batch outright — 30 of 100 records
   never reached the sink, yet the cursor advanced past them and the run exited 0.
-  **Not fixed**: the two specs disagree (see the scenario's closing note), so it
-  measures and reports the loss rather than encoding an answer.
+  **Documented, not yet fixed**: ARCHITECTURE.md §6.2 and docs/modules.md now
+  describe this skip-on-error behaviour; the scenario measures and reports the
+  loss so the number is visible until processor batches are retried like sink
+  batches are.
 
 ---
 

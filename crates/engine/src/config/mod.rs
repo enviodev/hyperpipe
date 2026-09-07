@@ -470,17 +470,28 @@ impl Config {
         let mut doc: serde_json::Value =
             serde_norway::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
 
-        // 2. Resolve secrets everywhere; report all missing at once.
-        let missing = secret::resolve_in_place(&mut doc, secrets);
-        if !missing.is_empty() {
-            return Err(ConfigError::MissingSecrets(missing.into_iter().collect()));
+        // 2. Shape-check the document BEFORE any secret is substituted. serde
+        //    error messages quote the offending value (`invalid type: string
+        //    "..."`, `unknown variant "..."`), and the CLI prints them, so a
+        //    `${secret:X}` placed in a non-string field must fail here with the
+        //    reference in the message rather than later with the value.
+        if let Err(e) = serde_json::from_value::<Config>(doc.clone()) {
+            return Err(ConfigError::Parse(e.to_string()));
         }
 
-        // 3. Strict typed deserialize (deny_unknown_fields catches typos).
-        let mut config: Config =
-            serde_json::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        // 3. Resolve secrets everywhere; report all missing at once.
+        let resolution = secret::resolve_in_place_report(&mut doc, secrets);
+        if !resolution.missing.is_empty() {
+            return Err(ConfigError::MissingSecrets(resolution.missing.into_iter().collect()));
+        }
 
-        // 4. Semantic validation + chain resolution.
+        // 4. Strict typed deserialize of the resolved document. The shape
+        //    already passed above, so this cannot normally fail; if it does,
+        //    scrub every resolved value out of the message before it escapes.
+        let mut config: Config = serde_json::from_value(doc)
+            .map_err(|e| ConfigError::Parse(resolution.redact(&e.to_string())))?;
+
+        // 5. Semantic validation + chain resolution.
         config.validate()?;
         Ok(config)
     }

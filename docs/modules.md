@@ -182,9 +182,12 @@ What the SDK gives you:
 
 The sandbox contract (§6.3): no filesystem, no sockets, no env. `http` only reaches hosts in
 your node's `permissions.http`; `sql_batch`/`blob_put` only reach connections in its
-`connections:` grants. Returning `Err` from `process`/`write` → engine retries the batch 3×,
-then pauses that branch (nothing is silently dropped). A hung module is killed at the epoch
-deadline (5–10 s); memory is capped per `resource_size`.
+`connections:` grants. Returning `Err` from a sink's `write` → the engine retries the batch
+3×, then pauses that branch (cursor frozen, error logged). Returning `Err` or trapping in a
+processor's `process` → the error is logged and that batch is skipped; the cursor still
+advances, so a processor should treat `Err` as "this batch is lost" and prefer
+`on_undecodable`-style per-record handling over failing the call. A hung module is killed at
+the epoch deadline (5–10 s); memory is capped per `resource_size`.
 
 Rust is supported today; TypeScript (via jco) and Go (TinyGo) target the same WIT contract
-and are on the phase-1 roadmap.
+but do not have SDKs yet.

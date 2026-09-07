@@ -95,7 +95,7 @@ Reference it with `module: { file: .../enrich.wasm }`. It adds `usd_estimate`
 and a `whale` flag to each transfer — proving any Rust (or TS/Go via the SDK)
 compiled to WASM plugs into the pipeline, sandboxed by the same capability model.
 
-## The pitch
+## Summary
 
 - **Ingestion**: HyperSync — up to 2000× faster than RPC, 70+ EVM chains + Fuel.
 - **Extensible**: every processor and sink is a swappable WASM module; users bring
