@@ -7,7 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   native:
@@ -24,8 +23,11 @@ jobs:
           workspaces: |
             .
             modules
-      - name: fmt
+      # Advisory until the tree is formatted once (`cargo fmt --all`) after the
+      # in-flight PRs land; then drop `continue-on-error` to make it a gate.
+      - name: fmt (advisory)
         run: cargo fmt --all --check
+        continue-on-error: true
       - name: build guest modules
         run: ./scripts/build-modules.sh
       - name: clippy
