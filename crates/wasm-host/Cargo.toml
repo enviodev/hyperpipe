@@ -22,7 +22,7 @@ sqlx = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 bytes = { workspace = true }
-object_store = { version = "0.11", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

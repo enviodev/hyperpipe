@@ -9,7 +9,7 @@ description = "HyperPipe pipeline engine: config, DAG runtime, checkpoint coordi
 hp-encoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+serde_norway = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

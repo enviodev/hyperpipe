@@ -7,7 +7,8 @@ use std::sync::Mutex;
 
 use wasmtime::component::ResourceTable;
 use wasmtime::StoreLimits;
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use object_store::ObjectStoreExt as _;
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 // Bindgen for the `processor` world. This also generates the shared `host` and
 // `types` interface modules that the `sink` world reuses via `with`.
@@ -15,7 +16,10 @@ pub mod proc_bindings {
     wasmtime::component::bindgen!({
         world: "processor",
         path: "../../wit",
-        trappable_imports: true,
+        // WIT `result<_, string>` imports come back as
+        // `wasmtime::Result<Result<T, String>>`: the inner value is the
+        // guest-visible error, the outer one is a trap.
+        imports: { default: trappable },
     });
 }
 
@@ -25,7 +29,7 @@ pub mod sink_bindings {
     wasmtime::component::bindgen!({
         world: "sink",
         path: "../../wit",
-        trappable_imports: true,
+        imports: { default: trappable },
         with: {
             "envio:hyperpipe/host": crate::host_impl::proc_bindings::envio::hyperpipe::host,
             "envio:hyperpipe/types": crate::host_impl::proc_bindings::envio::hyperpipe::types,
@@ -152,11 +156,8 @@ fn host_allowed_by(allow: &[String], url: &str) -> bool {
 const HTTP_BODY_LIMIT: usize = 32 << 20; // 32 MiB
 
 impl WasiView for HostState {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView { ctx: &mut self.wasi, table: &mut self.table }
     }
 }
 

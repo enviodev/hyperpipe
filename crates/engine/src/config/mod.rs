@@ -468,7 +468,7 @@ impl Config {
     pub fn load_str(text: &str, secrets: &dyn SecretSource) -> Result<Config> {
         // 1. YAML -> generic JSON document.
         let mut doc: serde_json::Value =
-            serde_yaml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+            serde_norway::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
 
         // 2. Shape-check the document BEFORE any secret is substituted. serde
         //    error messages quote the offending value (`invalid type: string
