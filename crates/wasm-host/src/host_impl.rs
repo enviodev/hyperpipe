@@ -206,9 +206,13 @@ impl Host for HostState {
 
     fn http(&mut self, req: HttpRequest) -> wasmtime::Result<Result<HttpResponse, String>> {
         if !self.host_allowed(&req.url) {
+            // Only the host goes into the message: it is returned to the guest
+            // and logged by the engine, and webhook-style URLs carry their
+            // credential in the path.
             return Ok(Err(format!(
-                "http denied: host of `{}` not in permissions.http allowlist {:?}",
-                req.url, self.http_allow
+                "http denied: host `{}` not in permissions.http allowlist {:?}",
+                url_host(&req.url).unwrap_or_else(|| "<invalid url>".into()),
+                self.http_allow
             )));
         }
         let client = self.services.http.clone();
@@ -480,6 +484,7 @@ mod tests {
         let e = out.err().expect("must be denied");
         assert!(e.contains("http denied"), "got {e}");
         assert!(e.contains("api.example.com"), "the error should show the allowlist: {e}");
+        assert!(!e.contains("/hook"), "the URL path must not be echoed: {e}");
         assert_eq!(srv.call_count(), 0, "a denied call must not reach the server");
     }
 
