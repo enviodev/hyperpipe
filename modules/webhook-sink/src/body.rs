@@ -13,10 +13,40 @@ pub fn ndjson(records: &[Value]) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
+/// `scheme://host[:port]` of a URL, for log and error messages. Webhook URLs
+/// routinely carry the credential in the path (Slack, Discord, Teams), and
+/// everything a sink returns as an error is logged by the engine on every
+/// retry, so the path and query must never appear in one.
+pub fn redact_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some(x) => x,
+        None => return "<invalid url>".to_string(),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    if host.is_empty() {
+        return "<invalid url>".to_string();
+    }
+    format!("{scheme}://{host}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn redact_url_keeps_only_scheme_and_host() {
+        assert_eq!(
+            redact_url("https://hooks.slack.com/services/T000/B000/secretsecret"),
+            "https://hooks.slack.com"
+        );
+        assert_eq!(redact_url("http://127.0.0.1:8080/hook?token=abc#x"), "http://127.0.0.1:8080");
+        assert_eq!(redact_url("https://user:pw@example.com/x"), "https://example.com");
+        assert_eq!(redact_url("https://example.com"), "https://example.com");
+        assert_eq!(redact_url("garbage"), "<invalid url>");
+        assert_eq!(redact_url("https://"), "<invalid url>");
+    }
 
     #[test]
     fn builds_ndjson() {

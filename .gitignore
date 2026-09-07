@@ -4,10 +4,18 @@
 *.db
 *.db-shm
 *.db-wal
-.env
 *.cwasm
 /dist
-pipeline.env
+
+# Secrets: any env file anywhere (pipeline.env, deploy/hyperpipe.env, .env,
+# .env.local ...). The committed templates end in .example and stay tracked.
+.env
+.env.*
+*.env
+**/pipeline.env
+
+# The user's copy of deploy/pipeline.example.yaml (docker compose mounts it).
+/deploy/pipeline.yaml
 
 # Coverage: instrumented binaries drop these wherever they are run from
 # (LLVM_PROFILE_FILE only redirects them when it is exported).

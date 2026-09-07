@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    name: native (build, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            modules
+      # Advisory until the tree is formatted once (`cargo fmt --all`) after the
+      # in-flight PRs land; then drop `continue-on-error` to make it a gate.
+      - name: fmt (advisory)
+        run: cargo fmt --all --check
+        continue-on-error: true
+      - name: build guest modules
+        run: ./scripts/build-modules.sh
+      - name: clippy
+        run: cargo clippy --workspace --all-targets
+      - name: test
+        run: cargo test --workspace
+      - name: guest module tests
+        run: cargo test
+        working-directory: modules
+      - name: guest clippy
+        run: cargo clippy --workspace --all-targets --target wasm32-wasip2
+        working-directory: modules
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: audit native workspace
+        run: cargo audit
+      - name: audit guest workspace
+        run: cargo audit
+        working-directory: modules
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
